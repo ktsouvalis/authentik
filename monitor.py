@@ -2,16 +2,16 @@
 UoP Authentik HA Cluster Monitor
 ---------------------------------
 Real-time TUI dashboard for the full Authentik HA stack.
-All connection details read from config.yaml (or a path passed as first argument).
+All connection details read from config.yml (or a path passed as first argument).
 
 Usage:
-    python monitor.py                        # uses config.yaml in current dir
-    python monitor.py config.site-b.yaml    # use a specific config file
+    python monitor.py                        # uses config.yml in current dir
+    python monitor.py config.site-b.yml    # use a specific config file
 """
 
 import sys
 import os
-import asyncio
+# import asyncio
 from datetime import datetime
 from typing import Optional
 
