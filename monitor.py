@@ -6,7 +6,7 @@ All connection details read from config.yml (or a path passed as first argument)
 
 Usage:
     python monitor.py                        # uses config.yml in current dir
-    python monitor.py config.site-b.yml    # use a specific config file
+    python monitor.py config.site-b.yml     # use a specific config file
 """
 
 import sys
@@ -172,17 +172,32 @@ def check_etcd_node(node: dict) -> dict:
     try:
         r = requests.get(f"http://{ip}:{P_ETCD}/health", timeout=HTTP_TIMEOUT)
         healthy = r.json().get("health") in (True, "true")
-        r2 = requests.get(f"http://{ip}:{P_ETCD}/v2/stats/self", timeout=HTTP_TIMEOUT)
-        state = r2.json().get("state", "unknown")
-        return {
-            "ip": ip, "name": node.get("name", ip),
-            "ok": healthy, "leader": state == "StateLeader", "state": state,
-        }
     except Exception:
-        return {
-            "ip": ip, "name": node.get("name", ip),
-            "ok": False, "leader": False, "state": "unreachable",
-        }
+        return {"ip": ip, "name": node.get("name", ip),
+                "ok": False, "leader": False, "raft_term": "?", "db_kb": 0}
+    # etcd 3.5+ v3 API — POST /v3/maintenance/status
+    # member_id == leader means this node is the leader
+    is_leader = False
+    raft_term = "?"
+    db_kb = 0
+    try:
+        r2 = requests.post(
+            f"http://{ip}:{P_ETCD}/v3/maintenance/status",
+            json={}, timeout=HTTP_TIMEOUT,
+        )
+        d2 = r2.json()
+        member_id = d2.get("header", {}).get("member_id", "")
+        leader_id = d2.get("leader", "")
+        is_leader = bool(member_id and leader_id and member_id == leader_id)
+        raft_term = d2.get("raftTerm", "?")
+        db_kb     = int(d2.get("dbSizeInUse", 0)) // 1024
+    except Exception:
+        pass
+    return {
+        "ip": ip, "name": node.get("name", ip),
+        "ok": healthy, "leader": is_leader,
+        "raft_term": raft_term, "db_kb": db_kb,
+    }
 
 
 def check_haproxy_node(node: dict) -> dict:
@@ -288,13 +303,13 @@ def check_authentik_node(node: dict) -> dict:
     try:
         r = requests.get(f"https://{ip}:{P_AUTHENTIK}/-/health/live/",
                          timeout=HTTP_TIMEOUT, verify=False)
-        server_ok = r.status_code == 204
+        server_ok = r.status_code in (200, 204)
     except Exception:
         server_ok = False
     try:
         r2 = requests.get(f"https://{ip}:{P_AUTHENTIK}/-/health/ready/",
                           timeout=HTTP_TIMEOUT, verify=False)
-        worker_ok = r2.status_code == 204
+        worker_ok = r2.status_code in (200, 204)
     except Exception:
         worker_ok = False
     return {"ip": ip, "name": node.get("name", ip),
@@ -410,10 +425,18 @@ class EtcdPanel(Static):
             if not node["ok"]:
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
                 continue
+            term  = node.get("raft_term", "?")
+            db_kb = node.get("db_kb", 0)
             if node["leader"]:
-                lines.append(f"  {OK} [bold green]{name:<14}[/] [bold green]LEADER[/]")
+                lines.append(
+                    f"  {OK} [bold green]{name:<14}[/] [bold green]LEADER[/]  "
+                    f"term=[cyan]{term}[/]  db=[cyan]{db_kb}KB[/]"
+                )
             else:
-                lines.append(f"  {GREY} [dim white]{name:<14}[/] [dim white]FOLLOWER[/]")
+                lines.append(
+                    f"  {GREY} [dim white]{name:<14}[/] [dim white]FOLLOWER[/]  "
+                    f"term=[cyan]{term}[/]  db=[cyan]{db_kb}KB[/]"
+                )
         return "\n".join(lines)
 
     def watch_data(self, data: list) -> None:
@@ -433,17 +456,18 @@ class HAProxyPanel(Static):
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]STATS UNREACHABLE[/]")
                 continue
             backends  = node.get("backends", {})
-            all_ok    = True
+            any_zero  = False
             parts     = []
             for pxname, servers in backends.items():
                 ups   = sum(1 for s in servers if s["status"] == "UP")
                 total = len(servers)
-                if ups < total:
-                    all_ok = False
+                # 0/N is a real problem; partial (e.g. 1/3 on primary) is by design
+                if ups == 0:
+                    any_zero = True
                 parts.append(f"[cyan]{pxname}[/]: {ups}/{total}")
             summary = "  ".join(parts) if parts else "[dim]no backends[/]"
-            d_dot   = OK if all_ok else WARN
-            color   = "green" if all_ok else "yellow"
+            d_dot   = DOWN if any_zero else OK
+            color   = "red" if any_zero else "green"
             lines.append(f"  {d_dot} [bold {color}]{name:<14}[/] {summary}")
         return "\n".join(lines)
 
@@ -590,6 +614,7 @@ Screen {
     margin: 0 1 1 1;
     height: auto;
     background: #161b22;
+    width: 1fr;
 }
 
 Footer {
