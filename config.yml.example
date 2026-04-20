@@ -1,0 +1,93 @@
+# ============================================================
+#  UoP Authentik HA Cluster Monitor — Site Configuration
+#  Copy to config.yaml and fill in your values.
+#  One file per site (config.site-a.yaml, config.site-b.yaml…)
+# ============================================================
+
+site_name: "UoP Authentik HA Cluster — Site A"
+
+# Auto-refresh interval in seconds
+refresh_interval: 30
+
+# HTTP and Redis timeouts in seconds
+http_timeout: 4
+redis_timeout: 3
+
+# VIP managed by keepalived
+vip: "<your VIP>"
+
+# Network interface keepalived runs on (used for display only)
+vrrp_interface: "ens18"
+
+nodes:
+  authentik:
+    - ip: "<node-1-ip>"
+      name: "ak-node-1"
+    - ip: "<node-2-ip>"
+      name: "ak-node-2"
+    - ip: "<node-3-ip>"
+      name: "ak-node-3"
+
+  patroni:
+    - ip: "<node-1-ip>"
+      name: "ak-node-1"
+    - ip: "<node-2-ip>"
+      name: "ak-node-2"
+    - ip: "<node-3-ip>"
+      name: "ak-node-3"
+
+  etcd:
+    - ip: "<node-1-ip>"
+      name: "ak-node-1"
+    - ip: "<node-2-ip>"
+      name: "ak-node-2"
+    - ip: "<node-3-ip>"
+      name: "ak-node-3"
+
+  haproxy:
+    - ip: "<node-1-ip>"
+      name: "ak-node-1"
+    - ip: "<node-2-ip>"
+      name: "ak-node-2"
+    - ip: "<node-3-ip>"
+      name: "ak-node-3"
+
+  redis:
+    - ip: "<node-4-ip>"
+      name: "ak-node-4"
+    - ip: "<node-5-ip>"
+      name: "ak-node-5"
+    - ip: "<node-6-ip>"
+      name: "ak-node-6"
+
+ports:
+  authentik: 9443
+  patroni: 8008
+  etcd: 2379
+  haproxy_stats: 9000
+  redis: 6379
+  sentinel: 26379
+
+credentials:
+  haproxy_stats_user: "admin"
+  haproxy_stats_pass: "your_haproxy_stats_password"
+  redis_password: "your_redis_password"
+
+sentinel:
+  master_name: "mymaster"
+
+keepalived:
+  # Base priorities per node — must match your keepalived.conf
+  # The monitor uses these to calculate effective priority
+  # (effective = base - 20 if nginx is down, per weight -20 in track script)
+  track_weight: -20
+  nodes:
+    - ip: "<node-1-ip>"
+      name: "ak-node-1"
+      base_priority: 100
+    - ip: "<node-2-ip>"
+      name: "ak-node-2"
+      base_priority: 90
+    - ip: "<node-3-ip>"
+      name: "ak-node-3"
+      base_priority: 80
