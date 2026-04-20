@@ -11,7 +11,6 @@ Usage:
 
 import sys
 import os
-# import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -142,20 +141,29 @@ def check_patroni_node(node: dict) -> dict:
     try:
         r = requests.get(f"http://{ip}:{P_PATRONI}/", timeout=HTTP_TIMEOUT)
         data = r.json()
+        raw_role = data.get("role", "unknown")
+        # Patroni 4.x uses "primary"; older versions used "master"
+        is_leader = raw_role in ("primary", "master", "standby_leader")
+        role = "primary" if is_leader else "replica"
+        tl = data.get("timeline")
+        tl_str = str(tl) if tl is not None else "—"
+        # replication_state is top-level on replicas in newer Patroni
+        repl_state = data.get("replication_state", "")
+        state = repl_state if repl_state else data.get("state", "unknown")
         return {
             "ip": ip,
             "name": node.get("name", ip),
             "ok": True,
-            "role": data.get("role", "unknown"),
-            "state": data.get("state", "unknown"),
-            "timeline": data.get("timeline", "?"),
+            "role": role,
+            "state": state,
+            "timeline": tl_str,
             "pending_restart": data.get("pending_restart", False),
         }
     except Exception:
         return {
             "ip": ip, "name": node.get("name", ip),
             "ok": False, "role": "down", "state": "unreachable",
-            "timeline": "?", "pending_restart": False,
+            "timeline": "—", "pending_restart": False,
         }
 
 
@@ -376,7 +384,7 @@ class PatroniPanel(Static):
             state = node["state"]
             tl    = node["timeline"]
             pend  = " [yellow](restart pending)[/]" if node.get("pending_restart") else ""
-            is_leader = role == "master"
+            is_leader = role in ("primary", "master")
             d_dot     = OK if is_leader else GREY
             role_str  = "[bold green]LEADER[/]" if is_leader else "[dim white]REPLICA[/]"
             nfmt      = f"[bold green]{name:<14}[/]" if is_leader else f"[dim white]{name:<14}[/]"
