@@ -995,8 +995,13 @@ class ClusterMonitor(App):
         self.query_one("#panel-nginx").border_title = (
             f" {failures_to_dot(nginx_fail)}  NGINX CONNECTIONS  "
         )
+        cluster_tl = next(
+            (n["timeline"] for n in patroni_data if n["ok"] and n["role"] in ("primary", "master")),
+            None,
+        )
+        tl_suffix = f"  TL={cluster_tl}" if cluster_tl else ""
         self.query_one("#panel-patroni").border_title = (
-            f" {failures_to_dot(patroni_fail)}  POSTGRESQL / PATRONI  "
+            f" {failures_to_dot(patroni_fail)}  POSTGRESQL / PATRONI{tl_suffix}  "
         )
         self.query_one("#panel-etcd").border_title = (
             f" {failures_to_dot(etcd_fail)}  ETCD CLUSTER  "
