@@ -7,10 +7,10 @@
 site_name: "UoP Authentik HA Cluster — Site A"
 
 # Auto-refresh interval in seconds
-refresh_interval: 30
+refresh_interval: 20
 
 # HTTP and Redis timeouts in seconds
-http_timeout: 4
+http_timeout: 5
 redis_timeout: 3
 
 # VIP managed by keepalived
@@ -67,6 +67,7 @@ ports:
   haproxy_stats: 9000
   redis: 6379
   sentinel: 26379
+  nginx_status: 8080
 
 credentials:
   haproxy_stats_user: "admin"

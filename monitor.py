@@ -9,6 +9,7 @@ Usage:
     python monitor.py config.site-b.yml     # use a specific config file
 """
 
+import re
 import sys
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -74,6 +75,7 @@ P_ETCD        = int(PORTS.get("etcd", 2379))
 P_HAPROXY     = int(PORTS.get("haproxy_stats", 9000))
 P_REDIS       = int(PORTS.get("redis", 6379))
 P_SENTINEL    = int(PORTS.get("sentinel", 26379))
+P_NGINX_STATUS = int(PORTS.get("nginx_status", 8080))
 
 # Credentials
 HAPROXY_USER  = CREDS.get("haproxy_stats_user", "admin")
@@ -315,6 +317,28 @@ def check_authentik_node(node: dict) -> dict:
         worker_ok = False
     return {"ip": ip, "name": node.get("name", ip),
             "server_ok": server_ok, "worker_ok": worker_ok}
+
+
+def check_nginx_status(node: dict) -> dict:
+    ip = node["ip"]
+    try:
+        r = requests.get(f"http://{ip}:{P_NGINX_STATUS}/nginx_status",
+                         timeout=2)
+        if r.status_code != 200:
+            raise ValueError(f"status {r.status_code}")
+        text    = r.text
+        active  = int(re.search(r"Active connections:\s+(\d+)", text).group(1))
+        reading = int(re.search(r"Reading:\s+(\d+)",            text).group(1))
+        writing = int(re.search(r"Writing:\s+(\d+)",            text).group(1))
+        waiting = int(re.search(r"Waiting:\s+(\d+)",            text).group(1))
+        return {
+            "ip": ip, "name": node.get("name", ip), "ok": True,
+            "active": active, "reading": reading,
+            "writing": writing, "waiting": waiting,
+        }
+    except Exception:
+        return {"ip": ip, "name": node.get("name", ip), "ok": False,
+                "active": 0, "reading": 0, "writing": 0, "waiting": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +590,41 @@ class AuthentikPanel(Static):
         self.update(self.render_content())
 
 
+class NginxPanel(Static):
+    data: reactive[list] = reactive([])
+
+    def render_content(self) -> str:
+        if not self.data:
+            return "  [dim]Checking...[/]"
+        lines = []
+        ok_nodes     = [n for n in self.data if n["ok"]]
+        max_active   = max((n["active"] for n in ok_nodes), default=0)
+        for node in self.data:
+            name = node["name"]
+            if not node["ok"]:
+                lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
+                continue
+            active  = node["active"]
+            reading = node["reading"]
+            writing = node["writing"]
+            waiting = node["waiting"]
+            busiest = max_active > 1 and active == max_active
+            dot          = WARN if busiest else OK
+            name_fmt     = f"[yellow]{name:<14}[/]" if busiest else f"[green]{name:<14}[/]"
+            active_fmt   = f"[bold yellow]{active}[/]" if busiest else f"[bold cyan]{active}[/]"
+            lines.append(
+                f"  {dot} {name_fmt} "
+                f"active={active_fmt}  "
+                f"[dim]R=[/][cyan]{reading}[/]  "
+                f"[dim]W=[/][cyan]{writing}[/]  "
+                f"[dim]Wait=[/][cyan]{waiting}[/]"
+            )
+        return "\n".join(lines)
+
+    def watch_data(self, data: list) -> None:
+        self.update(self.render_content())
+
+
 class StatusBar(Static):
     last_refresh: reactive[str] = reactive("")
     status_dot:   reactive[str] = reactive(GREY)
@@ -644,6 +703,8 @@ class ClusterMonitor(App):
 
         yield KeepalivedPanel("  [dim]Checking...[/]",
                               id="panel-keepalived", classes="panel")
+        yield NginxPanel("  [dim]Checking...[/]",
+                         id="panel-nginx", classes="panel")
 
         with Horizontal(id="row-mid"):
             yield PatroniPanel("  [dim]Checking...[/]",
@@ -665,6 +726,7 @@ class ClusterMonitor(App):
 
     def on_mount(self) -> None:
         self.query_one("#panel-keepalived").border_title  = f" {GREY}  VIP / KEEPALIVED / NGINX  "
+        self.query_one("#panel-nginx").border_title       = f" {GREY}  NGINX CONNECTIONS  "
         self.query_one("#panel-patroni").border_title     = f" {GREY}  POSTGRESQL / PATRONI  "
         self.query_one("#panel-etcd").border_title        = f" {GREY}  ETCD CLUSTER  "
         self.query_one("#panel-redis").border_title       = f" {GREY}  REDIS  "
@@ -686,6 +748,7 @@ class ClusterMonitor(App):
             f_redis     = [ex.submit(check_redis_node,     n) for n in REDIS_NODES]
             f_sentinel  = [ex.submit(check_sentinel_node,  n) for n in REDIS_NODES]
             f_authentik = [ex.submit(check_authentik_node, n) for n in AK_NODES]
+            f_nginx     = [ex.submit(check_nginx_status,   n) for n in KA_NODES]
 
             vip_data       = f_vip.result()
             ka_data        = [f.result() for f in f_ka]
@@ -695,6 +758,7 @@ class ClusterMonitor(App):
             redis_data     = [f.result() for f in f_redis]
             sentinel_data  = [f.result() for f in f_sentinel]
             authentik_data = [f.result() for f in f_authentik]
+            nginx_data     = [f.result() for f in f_nginx]
 
         ts = datetime.now().strftime("%H:%M:%S")
 
@@ -703,14 +767,14 @@ class ClusterMonitor(App):
             vip_data, ka_data,
             patroni_data, etcd_data, haproxy_data,
             redis_data, sentinel_data, authentik_data,
-            ts,
+            nginx_data, ts,
         )
 
     def _apply_updates(
         self, vip_data, ka_data,
         patroni_data, etcd_data, haproxy_data,
         redis_data, sentinel_data, authentik_data,
-        ts,
+        nginx_data, ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
             "vip": vip_data, "nodes": ka_data
@@ -721,6 +785,7 @@ class ClusterMonitor(App):
         self.query_one("#panel-redis",    RedisPanel).data    = redis_data
         self.query_one("#panel-sentinel", SentinelPanel).data = sentinel_data
         self.query_one("#panel-authentik",AuthentikPanel).data = authentik_data
+        self.query_one("#panel-nginx",    NginxPanel).data     = nginx_data
 
         # --- per-service failure counts (out of 3 nodes) ---
         ka_fail       = sum(1 for n in ka_data       if not n["nginx_up"])
@@ -739,8 +804,13 @@ class ClusterMonitor(App):
         ]
 
         # --- update border titles with per-service dot ---
+        nginx_fail = sum(1 for n in nginx_data if not n["ok"])
+
         self.query_one("#panel-keepalived").border_title = (
             f" {failures_to_dot(ka_fail)}  VIP / KEEPALIVED / NGINX  "
+        )
+        self.query_one("#panel-nginx").border_title = (
+            f" {failures_to_dot(nginx_fail)}  NGINX CONNECTIONS  "
         )
         self.query_one("#panel-patroni").border_title = (
             f" {failures_to_dot(patroni_fail)}  POSTGRESQL / PATRONI  "
