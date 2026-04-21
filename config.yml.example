@@ -6,6 +6,10 @@
 
 site_name: "UoP Authentik HA Cluster — Site A"
 
+# Set to false if your terminal renders ● as underscores (common in Proxmox CTs without UTF-8 locale)
+# Omit or set to true to auto-detect from locale env vars (LANG/LC_ALL/LC_CTYPE)
+unicode_bullets: true
+
 # Auto-refresh interval in seconds
 refresh_interval: 20
 

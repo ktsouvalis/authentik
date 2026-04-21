@@ -250,20 +250,24 @@ def check_redis_node(node: dict) -> dict:
             socket_timeout=REDIS_TIMEOUT,
             socket_connect_timeout=REDIS_TIMEOUT,
         )
-        info = r.info("replication")
+        info_repl = r.info("replication")
+        info_mem  = r.info("memory")
         r.close()
         return {
             "ip": ip, "name": node.get("name", ip), "ok": True,
-            "role": info.get("role", "unknown"),
-            "connected_slaves": info.get("connected_slaves", 0),
-            "master_host": info.get("master_host"),
-            "master_link_status": info.get("master_link_status"),
+            "role": info_repl.get("role", "unknown"),
+            "connected_slaves": info_repl.get("connected_slaves", 0),
+            "master_host": info_repl.get("master_host"),
+            "master_link_status": info_repl.get("master_link_status"),
+            "mem_used": info_mem.get("used_memory", 0),
+            "mem_max":  info_mem.get("maxmemory", 0),
         }
     except Exception:
         return {
             "ip": ip, "name": node.get("name", ip), "ok": False,
             "role": "down", "connected_slaves": 0,
             "master_host": None, "master_link_status": None,
+            "mem_used": 0, "mem_max": 0,
         }
 
 
@@ -355,10 +359,31 @@ def check_nginx_status(node: dict) -> dict:
 # Dot indicators
 # ---------------------------------------------------------------------------
 
-OK   = "[bold green]●[/]"
-DOWN = "[bold red]●[/]"
-WARN = "[bold yellow]●[/]"
-GREY = "[dim white]●[/]"
+def _terminal_supports_unicode() -> bool:
+    # Config override takes priority
+    if CFG.get("unicode_bullets") is not None:
+        return bool(CFG["unicode_bullets"])
+    # Python 3.7+ defaults sys.stdout.encoding to utf-8 regardless of locale,
+    # so check the locale env vars which reflect the actual terminal capability.
+    import locale
+    for var in ("LC_ALL", "LC_CTYPE", "LANG"):
+        val = os.environ.get(var, "")
+        if val and "utf" in val.lower():
+            return True
+    try:
+        if "utf" in (locale.getpreferredencoding(False) or "").lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+_UNICODE = _terminal_supports_unicode()
+_BULLET = "●" if _UNICODE else "*"
+
+OK   = f"[bold green]{_BULLET}[/]"
+DOWN = f"[bold red]{_BULLET}[/]"
+WARN = f"[bold yellow]{_BULLET}[/]"
+GREY = f"[dim white]{_BULLET}[/]"
 
 
 def failures_to_dot(failures: int) -> str:
@@ -445,6 +470,23 @@ def _fmt_lag(lag_bytes: Optional[int]) -> str:
     else:
         color = "cyan"
     return f"  lag=[{color}]{val_str}[/]"
+
+
+def _fmt_mem_bar(used: int, maxmem: int, width: int = 10) -> str:
+    """Format Redis memory usage as a coloured % bar."""
+    if maxmem <= 0:
+        if used < 1024 * 1024:
+            human = f"{used // 1024}KB"
+        elif used < 1024 ** 3:
+            human = f"{used // (1024 * 1024)}MB"
+        else:
+            human = f"{used / (1024 ** 3):.1f}GB"
+        return f"  mem=[cyan]{human}[/][dim]/∞[/]" if _UNICODE else f"  mem=[cyan]{human}[/][dim]/no-limit[/]"
+    pct    = min(100, used * 100 // maxmem)
+    filled = pct * width // 100
+    bar    = ("█" * filled + "░" * (width - filled)) if _UNICODE else ("=" * filled + "-" * (width - filled))
+    color  = "bold red" if pct >= 90 else ("yellow" if pct >= 70 else "green")
+    return f"  mem=[{color}]{pct}%[/] [{color}]{bar}[/]"
 
 
 class PatroniPanel(Static):
@@ -552,11 +594,12 @@ class RedisPanel(Static):
             if not node["ok"]:
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
                 continue
+            mem_str = _fmt_mem_bar(node.get("mem_used", 0), node.get("mem_max", 0))
             if node["role"] == "master":
                 slaves = node.get("connected_slaves", 0)
                 lines.append(
                     f"  {OK} [bold green]{name:<14}[/] [bold green]MASTER[/]  "
-                    f"slaves=[cyan]{slaves}[/]"
+                    f"slaves=[cyan]{slaves}[/]{mem_str}"
                 )
             else:
                 mhost = node.get("master_host", "?")
@@ -564,7 +607,7 @@ class RedisPanel(Static):
                 link_str = f"[green]{mlink}[/]" if mlink == "up" else f"[red]{mlink}[/]"
                 lines.append(
                     f"  {GREY} [dim white]{name:<14}[/] [dim white]REPLICA[/]  "
-                    f"master=[cyan]{mhost}[/]  link={link_str}"
+                    f"master=[cyan]{mhost}[/]  link={link_str}{mem_str}"
                 )
         return "\n".join(lines)
 
