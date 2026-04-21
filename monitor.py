@@ -78,10 +78,11 @@ P_SENTINEL    = int(PORTS.get("sentinel", 26379))
 P_NGINX_STATUS = int(PORTS.get("nginx_status", 8080))
 
 # Credentials
-HAPROXY_USER  = CREDS.get("haproxy_stats_user", "admin")
-HAPROXY_PASS  = CREDS.get("haproxy_stats_pass", "")
-REDIS_PASS    = CREDS.get("redis_password", "")
-SENTINEL_NAME = SENTINEL_CFG.get("master_name", "mymaster")
+HAPROXY_USER        = CREDS.get("haproxy_stats_user", "admin")
+HAPROXY_PASS        = CREDS.get("haproxy_stats_pass", "")
+REDIS_PASS          = CREDS.get("redis_password", "")
+AUTHENTIK_API_TOKEN = CREDS.get("authentik_api_token", "")
+SENTINEL_NAME       = SENTINEL_CFG.get("master_name", "mymaster")
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +338,40 @@ def check_authentik_node(node: dict) -> dict:
         worker_ok = False
     return {"ip": ip, "name": node.get("name", ip),
             "server_ok": server_ok, "worker_ok": worker_ok}
+
+
+def check_authentik_task_queue() -> dict:
+    """
+    Poll /api/v3/tasks/tasks/status/ for background task health.
+    Rejected/errored tasks (email, outpost sync, policy cache…) don't affect
+    /health/ready but cause silent UX failures.
+    """
+    if not AUTHENTIK_API_TOKEN:
+        return {"ok": None, "error": "no token configured"}
+    try:
+        r = requests.get(
+            f"https://{VIP}:{P_AUTHENTIK}/api/v3/tasks/tasks/status/",
+            headers={"Authorization": f"Bearer {AUTHENTIK_API_TOKEN}"},
+            timeout=HTTP_TIMEOUT,
+            verify=False,
+        )
+        if r.status_code in (401, 403):
+            return {"ok": False, "error": "unauthorized — token needs superuser permissions"}
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code}"}
+        d = r.json()
+        return {
+            "ok":        True,
+            "queued":    d.get("queued",    0),
+            "running":   d.get("running",   0),
+            "rejected":  d.get("rejected",  0),
+            "error":     d.get("error",     0),
+            "warning":   d.get("warning",   0),
+            "done":      d.get("done",      0),
+            "consumed":  d.get("consumed",  0),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def check_nginx_status(node: dict) -> dict:
@@ -675,6 +710,58 @@ class AuthentikPanel(Static):
         self.update(self.render_content())
 
 
+class WorkerQueuePanel(Static):
+    data: reactive[dict] = reactive({})
+
+    def render_content(self) -> str:
+        d = self.data
+        if not d:
+            return "  [dim]Checking...[/]"
+
+        ok = d.get("ok")
+        if ok is None:
+            return f"  {GREY} [dim]No API token configured — set credentials.authentik_api_token in config.yml[/]"
+        if ok is False:
+            return f"  {DOWN} [bold red]ERROR:[/] {d.get('error', 'unknown')}"
+
+        error    = d.get("error",    0)
+        warning  = d.get("warning",  0)
+        rejected = d.get("rejected", 0)
+        running  = d.get("running",  0)
+        queued   = d.get("queued",   0)
+        done     = d.get("done",     0)
+
+        if error:
+            dot   = DOWN
+            color = "red"
+            state = f"[bold red]{error} error(s)[/]"
+        elif rejected:
+            dot   = WARN
+            color = "yellow"
+            state = f"[yellow]{rejected} rejected[/]"
+        elif warning:
+            dot   = WARN
+            color = "yellow"
+            state = f"[yellow]{warning} warning(s)[/]"
+        else:
+            dot   = OK
+            color = "green"
+            state = "[bold green]healthy[/]"
+
+        parts = [f"  {dot} [{color}]worker tasks[/] {state}"]
+        parts.append(
+            f"    [dim]running=[/][cyan]{running}[/]  "
+            f"[dim]queued=[/][cyan]{queued}[/]  "
+            f"[dim]rejected=[/]"
+            + (f"[yellow]{rejected}[/]" if rejected else f"[cyan]{rejected}[/]")
+            + f"  [dim]done=[/][cyan]{done}[/]"
+        )
+        return "\n".join(parts)
+
+    def watch_data(self, data: dict) -> None:
+        self.update(self.render_content())
+
+
 class NginxPanel(Static):
     data: reactive[list] = reactive([])
 
@@ -807,6 +894,8 @@ class ClusterMonitor(App):
                            id="panel-haproxy", classes="panel")
         yield AuthentikPanel("  [dim]Checking...[/]",
                              id="panel-authentik", classes="panel")
+        yield WorkerQueuePanel("  [dim]Checking...[/]",
+                               id="panel-worker-queue", classes="panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -816,8 +905,9 @@ class ClusterMonitor(App):
         self.query_one("#panel-etcd").border_title        = f" {GREY}  ETCD CLUSTER  "
         self.query_one("#panel-redis").border_title       = f" {GREY}  REDIS  "
         self.query_one("#panel-sentinel").border_title    = f" {GREY}  REDIS SENTINEL  "
-        self.query_one("#panel-haproxy").border_title     = f" {GREY}  HAPROXY BACKENDS  "
-        self.query_one("#panel-authentik").border_title   = f" {GREY}  AUTHENTIK BACKENDS  "
+        self.query_one("#panel-haproxy").border_title        = f" {GREY}  HAPROXY BACKENDS  "
+        self.query_one("#panel-authentik").border_title     = f" {GREY}  AUTHENTIK BACKENDS  "
+        self.query_one("#panel-worker-queue").border_title  = f" {GREY}  AUTHENTIK WORKER QUEUE  "
 
         self.set_interval(REFRESH_INTERVAL, self.action_refresh_now)
         self.action_refresh_now()
@@ -825,25 +915,27 @@ class ClusterMonitor(App):
     @work(thread=True)
     def action_refresh_now(self) -> None:
         with ThreadPoolExecutor(max_workers=32) as ex:
-            f_vip       = ex.submit(check_vip_holder)
-            f_ka        = [ex.submit(check_keepalived_node, n) for n in KA_NODES]
-            f_patroni   = [ex.submit(check_patroni_node,   n) for n in PATRONI_NODES]
-            f_etcd      = [ex.submit(check_etcd_node,      n) for n in ETCD_NODES]
-            f_haproxy   = [ex.submit(check_haproxy_node,   n) for n in HAPROXY_NODES]
-            f_redis     = [ex.submit(check_redis_node,     n) for n in REDIS_NODES]
-            f_sentinel  = [ex.submit(check_sentinel_node,  n) for n in REDIS_NODES]
-            f_authentik = [ex.submit(check_authentik_node, n) for n in AK_NODES]
-            f_nginx     = [ex.submit(check_nginx_status,   n) for n in KA_NODES]
+            f_vip          = ex.submit(check_vip_holder)
+            f_ka           = [ex.submit(check_keepalived_node, n) for n in KA_NODES]
+            f_patroni      = [ex.submit(check_patroni_node,   n) for n in PATRONI_NODES]
+            f_etcd         = [ex.submit(check_etcd_node,      n) for n in ETCD_NODES]
+            f_haproxy      = [ex.submit(check_haproxy_node,   n) for n in HAPROXY_NODES]
+            f_redis        = [ex.submit(check_redis_node,     n) for n in REDIS_NODES]
+            f_sentinel     = [ex.submit(check_sentinel_node,  n) for n in REDIS_NODES]
+            f_authentik    = [ex.submit(check_authentik_node, n) for n in AK_NODES]
+            f_nginx        = [ex.submit(check_nginx_status,   n) for n in KA_NODES]
+            f_worker_queue = ex.submit(check_authentik_task_queue)
 
-            vip_data       = f_vip.result()
-            ka_data        = [f.result() for f in f_ka]
-            patroni_data   = [f.result() for f in f_patroni]
-            etcd_data      = [f.result() for f in f_etcd]
-            haproxy_data   = [f.result() for f in f_haproxy]
-            redis_data     = [f.result() for f in f_redis]
-            sentinel_data  = [f.result() for f in f_sentinel]
-            authentik_data = [f.result() for f in f_authentik]
-            nginx_data     = [f.result() for f in f_nginx]
+            vip_data         = f_vip.result()
+            ka_data          = [f.result() for f in f_ka]
+            patroni_data     = [f.result() for f in f_patroni]
+            etcd_data        = [f.result() for f in f_etcd]
+            haproxy_data     = [f.result() for f in f_haproxy]
+            redis_data       = [f.result() for f in f_redis]
+            sentinel_data    = [f.result() for f in f_sentinel]
+            authentik_data   = [f.result() for f in f_authentik]
+            nginx_data       = [f.result() for f in f_nginx]
+            worker_queue_data = f_worker_queue.result()
 
         ts = datetime.now().strftime("%H:%M:%S")
 
@@ -852,14 +944,14 @@ class ClusterMonitor(App):
             vip_data, ka_data,
             patroni_data, etcd_data, haproxy_data,
             redis_data, sentinel_data, authentik_data,
-            nginx_data, ts,
+            nginx_data, worker_queue_data, ts,
         )
 
     def _apply_updates(
         self, vip_data, ka_data,
         patroni_data, etcd_data, haproxy_data,
         redis_data, sentinel_data, authentik_data,
-        nginx_data, ts,
+        nginx_data, worker_queue_data, ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
             "vip": vip_data, "nodes": ka_data
@@ -869,8 +961,9 @@ class ClusterMonitor(App):
         self.query_one("#panel-haproxy",  HAProxyPanel).data  = haproxy_data
         self.query_one("#panel-redis",    RedisPanel).data    = redis_data
         self.query_one("#panel-sentinel", SentinelPanel).data = sentinel_data
-        self.query_one("#panel-authentik",AuthentikPanel).data = authentik_data
-        self.query_one("#panel-nginx",    NginxPanel).data     = nginx_data
+        self.query_one("#panel-authentik",   AuthentikPanel).data    = authentik_data
+        self.query_one("#panel-nginx",       NginxPanel).data        = nginx_data
+        self.query_one("#panel-worker-queue",WorkerQueuePanel).data  = worker_queue_data
 
         # --- per-service failure counts (out of 3 nodes) ---
         ka_fail       = sum(1 for n in ka_data       if not n["nginx_up"])
@@ -882,10 +975,15 @@ class ClusterMonitor(App):
         authentik_fail = sum(
             1 for n in authentik_data if not (n["server_ok"] and n["worker_ok"])
         )
+        wq = worker_queue_data
+        wq_fail = (
+            1 if wq.get("ok") is False
+            else (1 if wq.get("error", 0) > 0 else 0)
+        )
 
         all_failures = [
             ka_fail, patroni_fail, etcd_fail, haproxy_fail,
-            redis_fail, sentinel_fail, authentik_fail,
+            redis_fail, sentinel_fail, authentik_fail, wq_fail,
         ]
 
         # --- update border titles with per-service dot ---
@@ -914,6 +1012,15 @@ class ClusterMonitor(App):
         )
         self.query_one("#panel-authentik").border_title = (
             f" {failures_to_dot(authentik_fail)}  AUTHENTIK BACKENDS  "
+        )
+        wq_dot = (
+            GREY if wq.get("ok") is None
+            else DOWN if wq.get("ok") is False or wq.get("error", 0) > 0
+            else WARN if wq.get("rejected", 0) > 0 or wq.get("warning", 0) > 0
+            else OK
+        )
+        self.query_one("#panel-worker-queue").border_title = (
+            f" {wq_dot}  AUTHENTIK WORKER QUEUE  "
         )
 
         # --- central dot in title bar ---
