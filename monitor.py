@@ -11,6 +11,7 @@ Usage:
 
 import sys
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -326,6 +327,15 @@ WARN = "[bold yellow]●[/]"
 GREY = "[dim white]●[/]"
 
 
+def failures_to_dot(failures: int) -> str:
+    """Return a coloured dot based on how many nodes have failed (out of 3)."""
+    if failures >= 3:
+        return DOWN
+    elif failures >= 2:
+        return WARN
+    return OK
+
+
 # ---------------------------------------------------------------------------
 # Panels
 # ---------------------------------------------------------------------------
@@ -557,17 +567,13 @@ class AuthentikPanel(Static):
 
 
 class StatusBar(Static):
-    last_refresh: reactive[str]  = reactive("")
-    overall_ok:   reactive[bool] = reactive(True)
+    last_refresh: reactive[str] = reactive("")
+    status_dot:   reactive[str] = reactive(GREY)
 
     def render_content(self) -> str:
         ts = self.last_refresh or "—"
-        if self.overall_ok:
-            banner = "[bold green on dark_green]  ✔  ALL SYSTEMS OPERATIONAL  [/]"
-        else:
-            banner = "[bold white on red]  ✖  DEGRADED — CHECK PANELS BELOW  [/]"
         return (
-            f"{banner}    "
+            f"  {self.status_dot}    "
             f"[dim]Last refresh: {ts}   "
             f"Auto-refresh: {REFRESH_INTERVAL}s   "
             f"Config: {CONFIG_PATH}[/]"
@@ -576,7 +582,7 @@ class StatusBar(Static):
     def watch_last_refresh(self, _: str) -> None:
         self.update(self.render_content())
 
-    def watch_overall_ok(self, _: bool) -> None:
+    def watch_status_dot(self, _: str) -> None:
         self.update(self.render_content())
 
 
@@ -633,7 +639,7 @@ class ClusterMonitor(App):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Static(f"  ⬡  {SITE_NAME}", id="title")
+        yield Static(f"  {GREY}  {SITE_NAME}", id="title")
         yield StatusBar(id="statusbar")
 
         yield KeepalivedPanel("  [dim]Checking...[/]",
@@ -658,40 +664,37 @@ class ClusterMonitor(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#panel-keepalived").border_title  = "  VIP / KEEPALIVED / NGINX  "
-        self.query_one("#panel-patroni").border_title     = "  POSTGRESQL / PATRONI  "
-        self.query_one("#panel-etcd").border_title        = "  ETCD CLUSTER  "
-        self.query_one("#panel-redis").border_title       = "  REDIS  "
-        self.query_one("#panel-sentinel").border_title    = "  REDIS SENTINEL  "
-        self.query_one("#panel-haproxy").border_title     = "  HAPROXY BACKENDS  "
-        self.query_one("#panel-authentik").border_title   = "  AUTHENTIK BACKENDS  "
+        self.query_one("#panel-keepalived").border_title  = f" {GREY}  VIP / KEEPALIVED / NGINX  "
+        self.query_one("#panel-patroni").border_title     = f" {GREY}  POSTGRESQL / PATRONI  "
+        self.query_one("#panel-etcd").border_title        = f" {GREY}  ETCD CLUSTER  "
+        self.query_one("#panel-redis").border_title       = f" {GREY}  REDIS  "
+        self.query_one("#panel-sentinel").border_title    = f" {GREY}  REDIS SENTINEL  "
+        self.query_one("#panel-haproxy").border_title     = f" {GREY}  HAPROXY BACKENDS  "
+        self.query_one("#panel-authentik").border_title   = f" {GREY}  AUTHENTIK BACKENDS  "
 
         self.set_interval(REFRESH_INTERVAL, self.action_refresh_now)
         self.action_refresh_now()
 
     @work(thread=True)
     def action_refresh_now(self) -> None:
-        # Keepalived — VIP holder + per-node nginx/priority
-        vip_data   = check_vip_holder()
-        ka_data    = [check_keepalived_node(n) for n in KA_NODES]
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            f_vip       = ex.submit(check_vip_holder)
+            f_ka        = [ex.submit(check_keepalived_node, n) for n in KA_NODES]
+            f_patroni   = [ex.submit(check_patroni_node,   n) for n in PATRONI_NODES]
+            f_etcd      = [ex.submit(check_etcd_node,      n) for n in ETCD_NODES]
+            f_haproxy   = [ex.submit(check_haproxy_node,   n) for n in HAPROXY_NODES]
+            f_redis     = [ex.submit(check_redis_node,     n) for n in REDIS_NODES]
+            f_sentinel  = [ex.submit(check_sentinel_node,  n) for n in REDIS_NODES]
+            f_authentik = [ex.submit(check_authentik_node, n) for n in AK_NODES]
 
-        patroni_data   = [check_patroni_node(n)  for n in PATRONI_NODES]
-        etcd_data      = [check_etcd_node(n)     for n in ETCD_NODES]
-        haproxy_data   = [check_haproxy_node(n)  for n in HAPROXY_NODES]
-        redis_data     = [check_redis_node(n)    for n in REDIS_NODES]
-        sentinel_data  = [check_sentinel_node(n) for n in REDIS_NODES]
-        authentik_data = [check_authentik_node(n) for n in AK_NODES]
-
-        all_ok = (
-            vip_data.get("reachable", False)
-            and all(n["nginx_up"]                    for n in ka_data)
-            and all(n["ok"]                          for n in patroni_data)
-            and all(n["ok"]                          for n in etcd_data)
-            and all(n["ok"]                          for n in haproxy_data)
-            and all(n["ok"]                          for n in redis_data)
-            and all(n["ok"] and n["sentinel_ok"]     for n in sentinel_data)
-            and all(n["server_ok"] and n["worker_ok"] for n in authentik_data)
-        )
+            vip_data       = f_vip.result()
+            ka_data        = [f.result() for f in f_ka]
+            patroni_data   = [f.result() for f in f_patroni]
+            etcd_data      = [f.result() for f in f_etcd]
+            haproxy_data   = [f.result() for f in f_haproxy]
+            redis_data     = [f.result() for f in f_redis]
+            sentinel_data  = [f.result() for f in f_sentinel]
+            authentik_data = [f.result() for f in f_authentik]
 
         ts = datetime.now().strftime("%H:%M:%S")
 
@@ -700,14 +703,14 @@ class ClusterMonitor(App):
             vip_data, ka_data,
             patroni_data, etcd_data, haproxy_data,
             redis_data, sentinel_data, authentik_data,
-            all_ok, ts,
+            ts,
         )
 
     def _apply_updates(
         self, vip_data, ka_data,
         patroni_data, etcd_data, haproxy_data,
         redis_data, sentinel_data, authentik_data,
-        all_ok, ts,
+        ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
             "vip": vip_data, "nodes": ka_data
@@ -719,9 +722,57 @@ class ClusterMonitor(App):
         self.query_one("#panel-sentinel", SentinelPanel).data = sentinel_data
         self.query_one("#panel-authentik",AuthentikPanel).data = authentik_data
 
+        # --- per-service failure counts (out of 3 nodes) ---
+        ka_fail       = sum(1 for n in ka_data       if not n["nginx_up"])
+        patroni_fail  = sum(1 for n in patroni_data  if not n["ok"])
+        etcd_fail     = sum(1 for n in etcd_data     if not n["ok"])
+        haproxy_fail  = sum(1 for n in haproxy_data  if not n["ok"])
+        redis_fail    = sum(1 for n in redis_data    if not n["ok"])
+        sentinel_fail = sum(1 for n in sentinel_data if not n["ok"])
+        authentik_fail = sum(
+            1 for n in authentik_data if not (n["server_ok"] and n["worker_ok"])
+        )
+
+        all_failures = [
+            ka_fail, patroni_fail, etcd_fail, haproxy_fail,
+            redis_fail, sentinel_fail, authentik_fail,
+        ]
+
+        # --- update border titles with per-service dot ---
+        self.query_one("#panel-keepalived").border_title = (
+            f" {failures_to_dot(ka_fail)}  VIP / KEEPALIVED / NGINX  "
+        )
+        self.query_one("#panel-patroni").border_title = (
+            f" {failures_to_dot(patroni_fail)}  POSTGRESQL / PATRONI  "
+        )
+        self.query_one("#panel-etcd").border_title = (
+            f" {failures_to_dot(etcd_fail)}  ETCD CLUSTER  "
+        )
+        self.query_one("#panel-redis").border_title = (
+            f" {failures_to_dot(redis_fail)}  REDIS  "
+        )
+        self.query_one("#panel-sentinel").border_title = (
+            f" {failures_to_dot(sentinel_fail)}  REDIS SENTINEL  "
+        )
+        self.query_one("#panel-haproxy").border_title = (
+            f" {failures_to_dot(haproxy_fail)}  HAPROXY BACKENDS  "
+        )
+        self.query_one("#panel-authentik").border_title = (
+            f" {failures_to_dot(authentik_fail)}  AUTHENTIK BACKENDS  "
+        )
+
+        # --- central dot in title bar ---
+        if any(f >= 3 for f in all_failures):
+            central_dot = DOWN
+        elif any(f >= 2 for f in all_failures):
+            central_dot = WARN
+        else:
+            central_dot = OK
+        self.query_one("#title").update(f"  {central_dot}  {SITE_NAME}")
+
         sb = self.query_one("#statusbar", StatusBar)
-        sb.overall_ok    = all_ok
-        sb.last_refresh  = ts
+        sb.status_dot   = central_dot
+        sb.last_refresh = ts
 
 
 if __name__ == "__main__":
