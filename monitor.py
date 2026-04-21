@@ -153,6 +153,14 @@ def check_patroni_node(node: dict) -> dict:
         # replication_state is top-level on replicas in newer Patroni
         repl_state = data.get("replication_state", "")
         state = repl_state if repl_state else data.get("state", "unknown")
+        # Replication lag: only meaningful on replicas
+        lag_bytes = None
+        if not is_leader:
+            xlog = data.get("xlog", {})
+            received = xlog.get("received_location")
+            replayed = xlog.get("replayed_location")
+            if received is not None and replayed is not None:
+                lag_bytes = max(0, received - replayed)
         return {
             "ip": ip,
             "name": node.get("name", ip),
@@ -161,12 +169,14 @@ def check_patroni_node(node: dict) -> dict:
             "state": state,
             "timeline": tl_str,
             "pending_restart": data.get("pending_restart", False),
+            "lag_bytes": lag_bytes,
         }
     except Exception:
         return {
             "ip": ip, "name": node.get("name", ip),
             "ok": False, "role": "down", "state": "unreachable",
             "timeline": "—", "pending_restart": False,
+            "lag_bytes": None,
         }
 
 
@@ -417,6 +427,26 @@ class KeepalivedPanel(Static):
         self.update(self.render_content())
 
 
+def _fmt_lag(lag_bytes: Optional[int]) -> str:
+    """Format replication lag bytes into a coloured Rich string."""
+    if lag_bytes is None:
+        return ""
+    if lag_bytes < 1024:
+        val_str = f"{lag_bytes}B"
+    elif lag_bytes < 1024 * 1024:
+        val_str = f"{lag_bytes // 1024}KB"
+    else:
+        val_str = f"{lag_bytes // (1024 * 1024)}MB"
+
+    if lag_bytes > 100 * 1024 * 1024:
+        color = "bold red"
+    elif lag_bytes > 1024 * 1024:
+        color = "yellow"
+    else:
+        color = "cyan"
+    return f"  lag=[{color}]{val_str}[/]"
+
+
 class PatroniPanel(Static):
     data: reactive[list] = reactive([])
 
@@ -437,9 +467,10 @@ class PatroniPanel(Static):
             d_dot     = OK if is_leader else GREY
             role_str  = "[bold green]LEADER[/]" if is_leader else "[dim white]REPLICA[/]"
             nfmt      = f"[bold green]{name:<14}[/]" if is_leader else f"[dim white]{name:<14}[/]"
+            lag_str   = "" if is_leader else _fmt_lag(node.get("lag_bytes"))
             lines.append(
                 f"  {d_dot} {nfmt} {role_str}  "
-                f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{pend}"
+                f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{pend}"
             )
         return "\n".join(lines)
 
