@@ -224,7 +224,8 @@ def check_haproxy_node(node: dict) -> dict:
         if r.status_code != 200:
             return {"ip": ip, "name": node.get("name", ip), "ok": False, "backends": {}}
 
-        backends = {}
+        backends      = {}
+        backend_stats = {}
         for line in r.text.splitlines():
             if line.startswith("#") or not line.strip():
                 continue
@@ -232,11 +233,16 @@ def check_haproxy_node(node: dict) -> dict:
             if len(parts) < 18:
                 continue
             pxname, svname, status = parts[0], parts[1], parts[17]
-            if svname in ("FRONTEND", "BACKEND"):
+            if svname == "FRONTEND":
+                continue
+            if svname == "BACKEND":
+                def _int(col):
+                    return int(parts[col]) if len(parts) > col and parts[col].strip().isdigit() else 0
+                backend_stats[pxname] = {"rate": _int(33), "errs": _int(43)}
                 continue
             backends.setdefault(pxname, []).append({"server": svname, "status": status})
 
-        return {"ip": ip, "name": node.get("name", ip), "ok": True, "backends": backends}
+        return {"ip": ip, "name": node.get("name", ip), "ok": True, "backends": backends, "backend_stats": backend_stats}
     except Exception:
         return {"ip": ip, "name": node.get("name", ip), "ok": False, "backends": {}}
 
@@ -562,16 +568,21 @@ class HAProxyPanel(Static):
             if not node["ok"]:
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]STATS UNREACHABLE[/]")
                 continue
-            backends  = node.get("backends", {})
-            any_zero  = False
-            parts     = []
+            backends      = node.get("backends", {})
+            backend_stats = node.get("backend_stats", {})
+            any_zero      = False
+            parts         = []
             for pxname, servers in backends.items():
                 ups   = sum(1 for s in servers if s["status"] == "UP")
                 total = len(servers)
                 # 0/N is a real problem; partial (e.g. 1/3 on primary) is by design
                 if ups == 0:
                     any_zero = True
-                parts.append(f"[cyan]{pxname}[/]: {ups}/{total}")
+                stats   = backend_stats.get(pxname, {})
+                rate    = stats.get("rate", 0)
+                errs    = stats.get("errs", 0)
+                err_str = f"[red]5xx:{errs}[/]" if errs > 0 else "[dim]5xx:0[/]"
+                parts.append(f"[cyan]{pxname}[/]: {ups}/{total} {rate}/s {err_str}")
             summary = "  ".join(parts) if parts else "[dim]no backends[/]"
             d_dot   = DOWN if any_zero else OK
             color   = "red" if any_zero else "green"
