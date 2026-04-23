@@ -1,6 +1,6 @@
 # ak-monitor
 
-Real-time TUI dashboard for the **Authentik HA Cluster** stack at the University of Peloponnese.  
+Real-time TUI dashboard for **Authentik HA Cluster** stack .
 Monitors all services on one screen: keepalived VIP, Patroni/PostgreSQL, etcd, HAProxy, Redis, Redis Sentinel, and Authentik backends.
 
 Built with [Textual](https://textual.textualize.io/). No agents, no daemons — runs from any workstation that can reach the cluster network (or VXLAN interface).
@@ -23,14 +23,14 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 
 ## Color coding
 
-| Color | Meaning |
+| Indicator | Meaning |
 |---|---|
-| **Green ●** | Service is up and in primary/active/leader role |
-| **Dim grey ●** | Service is up but in backup/replica/follower role (healthy, non-primary) |
-| **Yellow ●** | Degraded — partial backends UP or sentinel flags set |
-| **Red ●** | Service is down or unreachable |
-| **Top banner green** | All services across all nodes are healthy |
-| **Top banner red** | One or more services are down |
+| ${\color{green}●}$ Green | Service is up and in primary/active/leader role |
+| ${\color{gray}●}$ Grey | Service is up but in backup/replica/follower role (healthy, non-primary) |
+| ${\color{yellow}●}$ Yellow | Degraded — partial backends UP or sentinel flags set |
+| ${\color{red}●}$ Red | Service is down or unreachable |
+| ${\color{green}●}$ Top banner green | All services across all nodes are healthy |
+| ${\color{red}●}$ Top banner red | One or more services are down |
 
 ---
 
@@ -47,14 +47,24 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 ---
 
 ## Installation
-
+1. Clone the repo and set up a Python environment:
 ```bash
 git clone <repo> ak-monitor
 cd ak-monitor
-
+```
+2. Create and activate a virtual environment
+```bash
 python3 -m venv venv
 source venv/bin/activate
+```
+or
 
+```bash
+conda create -n ak-monitor python=3.11
+conda activate ak-monitor
+```
+3. Install dependencies:
+```bash
 pip install -r requirements.txt
 ```
 
@@ -62,24 +72,22 @@ pip install -r requirements.txt
 
 ## Configuration
 
-All settings are driven by environment variables. No config files to edit.
+All settings are driven by configuration yaml variables. No config files to edit.
 
 ```bash
-cp .env.example .env
-nano .env          # fill in your IPs, passwords, node names
+cp config.example.yml config.yml
+nano config.yml     # fill in your IPs, passwords, node names
 ```
 
-Load the env and run:
+Load the default config file and run:
 
 ```bash
-set -a && source .env && set +a
 python monitor.py
 ```
-
-Or inline for a one-liner:
+or specify a custom config file:
 
 ```bash
-env $(cat .env | grep -v '^#' | xargs) python monitor.py
+python monitor.py --config custom_config.yaml
 ```
 
 ---
@@ -90,28 +98,7 @@ env $(cat .env | grep -v '^#' | xargs) python monitor.py
 |---|---|
 | `R` | Force immediate refresh |
 | `Q` | Quit |
-
----
-
-## Multi-site / VXLAN usage
-
-Each site gets its own `.env` file with its local IPs:
-
-```
-.env.site-a    # Patras  — VXLAN 10.10.1.x
-.env.site-b    # Tripoli — VXLAN 10.10.2.x
-.env.site-c    # Sparta  — VXLAN 10.10.3.x
-```
-
-Run per site:
-
-```bash
-env $(cat .env.site-b | grep -v '^#' | xargs) python monitor.py
-```
-
-Or open three terminal tabs, one per site.
-
-The `SITE_NAME` variable controls the label shown in the TUI title bar so you always know which cluster you're looking at.
+| `Ctrl+P` | Pallette |
 
 ---
 
