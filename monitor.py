@@ -952,9 +952,9 @@ class NginxPanel(Static):
             writing = node["writing"]
             waiting = node["waiting"]
             busiest = max_active > 1 and active == max_active
-            dot          = WARN if busiest else OK
-            name_fmt     = f"[yellow]{name:<14}[/]" if busiest else f"[green]{name:<14}[/]"
-            active_fmt   = f"[bold yellow]{active}[/]" if busiest else f"[bold cyan]{active}[/]"
+            dot          = OK
+            name_fmt     = f"[bold green]{name:<14}[/]" if busiest else f"[green]{name:<14}[/]"
+            active_fmt   = f"[bold green]{active}[/]" if busiest else f"[bold cyan]{active}[/]"
             lines.append(
                 f"  {dot} {name_fmt} "
                 f"active={active_fmt}  "
