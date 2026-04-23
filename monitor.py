@@ -640,9 +640,9 @@ class RedisPanel(Static):
             if not node["ok"]:
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
                 continue
-            mem_str = _fmt_mem_bar(node.get("mem_used", 0), node.get("mem_max", 0))
             if node["role"] == "master":
                 slaves = node.get("connected_slaves", 0)
+                mem_str = _fmt_mem_bar(node.get("mem_used", 0), node.get("mem_max", 0))
                 lines.append(
                     f"  {OK} [bold green]{name:<14}[/] [bold green]MASTER[/]  "
                     f"slaves=[cyan]{slaves}[/]{mem_str}"
@@ -653,7 +653,7 @@ class RedisPanel(Static):
                 link_str = f"[green]{mlink}[/]" if mlink == "up" else f"[red]{mlink}[/]"
                 lines.append(
                     f"  {GREY} [dim white]{name:<14}[/] [dim white]REPLICA[/]  "
-                    f"master=[cyan]{mhost}[/]  link={link_str}{mem_str}"
+                    f"master=[cyan]{mhost}[/]  link={link_str}"
                 )
         return "\n".join(lines)
 
