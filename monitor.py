@@ -334,7 +334,7 @@ def check_redis_node(node: dict) -> dict:
         info_repl = r.info("replication")
         info_mem  = r.info("memory")
         r.close()
-        return {
+        result = {
             "ip": ip, "name": node.get("name", ip), "ok": True,
             "role": info_repl.get("role", "unknown"),
             "connected_slaves": info_repl.get("connected_slaves", 0),
@@ -343,6 +343,25 @@ def check_redis_node(node: dict) -> dict:
             "mem_used": info_mem.get("used_memory", 0),
             "mem_max":  info_mem.get("maxmemory", 0),
         }
+        if info_repl.get("role") == "master":
+            master_offset = info_repl.get("master_repl_offset", 0)
+            replica_lags: dict = {}
+            for key, val in info_repl.items():
+                if not key.startswith("slave"):
+                    continue
+                if isinstance(val, dict):
+                    slave_ip = val.get("ip")
+                    slave_offset = int(val.get("offset", master_offset))
+                elif isinstance(val, str):
+                    parts = dict(p.split("=") for p in val.split(",") if "=" in p)
+                    slave_ip = parts.get("ip")
+                    slave_offset = int(parts.get("offset", master_offset))
+                else:
+                    continue
+                if slave_ip:
+                    replica_lags[slave_ip] = max(0, master_offset - slave_offset)
+            result["replica_lags"] = replica_lags
+        return result
     except Exception:
         return {
             "ip": ip, "name": node.get("name", ip), "ok": False,
@@ -646,7 +665,13 @@ class PatroniPanel(Static):
         hist = d.get("history") or {}
         if hist:
             raw_ts = hist.get("timestamp") or ""
-            ts_display = raw_ts.replace("T", " ")[:16] if raw_ts else "unknown time"
+            if raw_ts:
+                try:
+                    ts_display = datetime.fromisoformat(raw_ts).strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    ts_display = raw_ts.replace("T", " ")[:16]
+            else:
+                ts_display = "unknown time"
             reason = hist.get("reason", "unknown")
             tl     = hist.get("timeline", "?")
             lines.append(
@@ -761,6 +786,11 @@ class RedisPanel(Static):
     def render_content(self) -> str:
         if not self.data:
             return "  [dim]Checking...[/]"
+        replica_lags: dict = {}
+        for node in self.data:
+            if node.get("role") == "master" and "replica_lags" in node:
+                replica_lags = node["replica_lags"]
+                break
         lines = []
         for node in self.data:
             name = node["name"]
@@ -778,9 +808,11 @@ class RedisPanel(Static):
                 mhost = node.get("master_host", "?")
                 mlink = node.get("master_link_status", "?")
                 link_str = f"[green]{mlink}[/]" if mlink == "up" else f"[red]{mlink}[/]"
+                lag = replica_lags.get(node["ip"])
+                lag_str = _fmt_lag(lag) if lag else ""
                 lines.append(
                     f"  {GREY} [dim white]{name:<14}[/] [dim white]REPLICA[/]  "
-                    f"master=[cyan]{mhost}[/]  link={link_str}"
+                    f"master=[cyan]{mhost}[/]  link={link_str}{lag_str}"
                 )
         return "\n".join(lines)
 
