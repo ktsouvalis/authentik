@@ -72,12 +72,15 @@ ports:
   redis: 6379
   sentinel: 26379
   nginx_status: 8080
+  postgres: 5432
 
 credentials:
   haproxy_stats_user: "admin"
   haproxy_stats_pass: "your_haproxy_stats_password"
   redis_password: "your_redis_password"
   authentik_api_token: ""
+  postgres_user: "postgres"
+  postgres_password: "your_postgres_password"
 
 sentinel:
   master_name: "mymaster"

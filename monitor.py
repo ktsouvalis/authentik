@@ -16,6 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
+try:
+    import psycopg2
+    _HAS_PSYCOPG2 = True
+except ImportError:
+    _HAS_PSYCOPG2 = False
+
 import yaml
 import requests
 import redis as redis_lib
@@ -82,7 +88,13 @@ HAPROXY_USER        = CREDS.get("haproxy_stats_user", "admin")
 HAPROXY_PASS        = CREDS.get("haproxy_stats_pass", "")
 REDIS_PASS          = CREDS.get("redis_password", "")
 AUTHENTIK_API_TOKEN = CREDS.get("authentik_api_token", "")
+PG_USER             = CREDS.get("postgres_user", "postgres")
+PG_PASS             = CREDS.get("postgres_password", "")
 SENTINEL_NAME       = SENTINEL_CFG.get("master_name", "mymaster")
+
+P_POSTGRES          = int(PORTS.get("postgres", 5432))
+SLOT_WARN_BYTES     = 100 * 1024 * 1024   # 100 MB — yellow
+SLOT_CRIT_BYTES     = 1024 ** 3           # 1 GB  — red
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +191,68 @@ def check_patroni_node(node: dict) -> dict:
             "timeline": "—", "pending_restart": False,
             "lag_bytes": None,
         }
+
+
+def check_patroni_history(ip: str) -> dict:
+    """
+    Fetch /history from the primary and return the most recent timeline switch.
+    Returns {} if the endpoint is unreachable or history is empty.
+    """
+    try:
+        r = requests.get(f"http://{ip}:{P_PATRONI}/history", timeout=HTTP_TIMEOUT)
+        entries = r.json()
+        if not entries:
+            return {}
+        last = entries[-1]
+        # Patroni format: [timeline_id, switchpoint_lsn, reason, timestamp?]
+        return {
+            "timeline": last[0] if len(last) > 0 else "?",
+            "reason":    last[2] if len(last) > 2 else "unknown",
+            "timestamp": last[3] if len(last) > 3 else None,
+        }
+    except Exception:
+        return {}
+
+
+def check_replication_slots(ip: str) -> Optional[list]:
+    """
+    Query pg_replication_slots on the primary for slot name, type, active status,
+    and WAL lag. Returns None when credentials are missing or psycopg2 unavailable.
+    """
+    if not PG_PASS or not _HAS_PSYCOPG2:
+        return None
+    try:
+        conn = psycopg2.connect(
+            host=ip, port=P_POSTGRES,
+            user=PG_USER, password=PG_PASS,
+            dbname="postgres",
+            connect_timeout=HTTP_TIMEOUT,
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT slot_name, slot_type, active,
+                CASE
+                    WHEN slot_type = 'logical'
+                        THEN pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
+                    ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+                END AS lag_bytes
+            FROM pg_replication_slots
+            ORDER BY lag_bytes DESC NULLS LAST
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [
+            {
+                "name":      row[0],
+                "type":      row[1],
+                "active":    row[2],
+                "lag_bytes": int(row[3]) if row[3] is not None else 0,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return None
 
 
 def check_etcd_node(node: dict) -> dict:
@@ -530,14 +604,26 @@ def _fmt_mem_bar(used: int, maxmem: int, width: int = 10) -> str:
     return f"  mem=[{color}]{pct}%[/] [{color}]{bar}[/]"
 
 
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n // 1024}KB"
+    if n < 1024 ** 3:
+        return f"{n // (1024 * 1024)}MB"
+    return f"{n / (1024 ** 3):.1f}GB"
+
+
 class PatroniPanel(Static):
-    data: reactive[list] = reactive([])
+    data: reactive[dict] = reactive({})
 
     def render_content(self) -> str:
-        if not self.data:
+        d = self.data
+        if not d or "nodes" not in d:
             return "  [dim]Checking...[/]"
+
         lines = []
-        for node in self.data:
+        for node in d["nodes"]:
             name = node["name"]
             if not node["ok"]:
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
@@ -555,9 +641,50 @@ class PatroniPanel(Static):
                 f"  {d_dot} {nfmt} {role_str}  "
                 f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{pend}"
             )
+
+        # Last failover from /history
+        hist = d.get("history") or {}
+        if hist:
+            raw_ts = hist.get("timestamp") or ""
+            ts_display = raw_ts.replace("T", " ")[:16] if raw_ts else "unknown time"
+            reason = hist.get("reason", "unknown")
+            tl     = hist.get("timeline", "?")
+            lines.append(
+                f"  [dim]Last failover  TL {tl}  {ts_display}  →  {reason}[/]"
+            )
+
+        # Replication slots
+        slots = d.get("slots")
+        if slots is None and PG_PASS:
+            lines.append(f"  [dim]Slots: unavailable (psycopg2 missing)[/]")
+        elif slots is not None:
+            if not slots:
+                lines.append(f"  [dim]Slots: none[/]")
+            else:
+                any_warn = False
+                parts = []
+                for s in slots:
+                    lag   = s.get("lag_bytes", 0) or 0
+                    name  = s["name"]
+                    stype = s["type"][:4]
+                    act   = s["active"]
+                    lag_s = _fmt_bytes(lag)
+                    if not act and lag >= SLOT_CRIT_BYTES:
+                        color    = "bold red"
+                        any_warn = True
+                    elif not act or lag >= SLOT_WARN_BYTES:
+                        color    = "yellow"
+                        any_warn = True
+                    else:
+                        color = "dim white"
+                    act_s = "active" if act else "[red]INACTIVE[/]"
+                    parts.append(f"[{color}]{name}[/] ({stype},{act_s},[{color}]{lag_s}[/])")
+                dot = WARN if any_warn else GREY
+                lines.append(f"  {dot} [dim]slots:[/] {'  '.join(parts)}")
+
         return "\n".join(lines)
 
-    def watch_data(self, data: list) -> None:
+    def watch_data(self, data: dict) -> None:
         self.update(self.render_content())
 
 
@@ -926,37 +1053,56 @@ class ClusterMonitor(App):
             f_nginx        = [ex.submit(check_nginx_status,   n) for n in KA_NODES]
             f_worker_queue = ex.submit(check_authentik_task_queue)
 
-            vip_data         = f_vip.result()
-            ka_data          = [f.result() for f in f_ka]
-            patroni_data     = [f.result() for f in f_patroni]
-            etcd_data        = [f.result() for f in f_etcd]
-            haproxy_data     = [f.result() for f in f_haproxy]
-            redis_data       = [f.result() for f in f_redis]
-            sentinel_data    = [f.result() for f in f_sentinel]
-            authentik_data   = [f.result() for f in f_authentik]
-            nginx_data       = [f.result() for f in f_nginx]
+            # Patroni results needed first to identify the primary for dependent queries
+            patroni_data = [f.result() for f in f_patroni]
+            primary = next(
+                (n for n in patroni_data if n["ok"] and n["role"] in ("primary", "master")),
+                None,
+            )
+            primary_ip = primary["ip"] if primary else None
+
+            f_history = ex.submit(check_patroni_history,   primary_ip) if primary_ip else None
+            f_slots   = ex.submit(check_replication_slots, primary_ip) if primary_ip else None
+
+            vip_data          = f_vip.result()
+            ka_data           = [f.result() for f in f_ka]
+            etcd_data         = [f.result() for f in f_etcd]
+            haproxy_data      = [f.result() for f in f_haproxy]
+            redis_data        = [f.result() for f in f_redis]
+            sentinel_data     = [f.result() for f in f_sentinel]
+            authentik_data    = [f.result() for f in f_authentik]
+            nginx_data        = [f.result() for f in f_nginx]
             worker_queue_data = f_worker_queue.result()
+
+            history_data = f_history.result() if f_history else {}
+            slots_data   = f_slots.result()   if f_slots   else None
 
         ts = datetime.now().strftime("%H:%M:%S")
 
         self.call_from_thread(
             self._apply_updates,
             vip_data, ka_data,
-            patroni_data, etcd_data, haproxy_data,
+            patroni_data, history_data, slots_data,
+            etcd_data, haproxy_data,
             redis_data, sentinel_data, authentik_data,
             nginx_data, worker_queue_data, ts,
         )
 
     def _apply_updates(
         self, vip_data, ka_data,
-        patroni_data, etcd_data, haproxy_data,
+        patroni_data, history_data, slots_data,
+        etcd_data, haproxy_data,
         redis_data, sentinel_data, authentik_data,
         nginx_data, worker_queue_data, ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
             "vip": vip_data, "nodes": ka_data
         }
-        self.query_one("#panel-patroni",  PatroniPanel).data  = patroni_data
+        self.query_one("#panel-patroni", PatroniPanel).data = {
+            "nodes":   patroni_data,
+            "history": history_data,
+            "slots":   slots_data,
+        }
         self.query_one("#panel-etcd",     EtcdPanel).data     = etcd_data
         self.query_one("#panel-haproxy",  HAProxyPanel).data  = haproxy_data
         self.query_one("#panel-redis",    RedisPanel).data    = redis_data
