@@ -665,7 +665,8 @@ class PatroniPanel(Static):
             d_dot     = OK if is_leader else GREY
             role_str  = "[bold green]LEADER[/]" if is_leader else "[dim white]REPLICA[/]"
             nfmt      = f"[bold green]{name:<14}[/]" if is_leader else f"[dim white]{name:<14}[/]"
-            lag_str   = "" if is_leader else _fmt_lag(node.get("lag_bytes"), PATRONI_LAG_WARN, PATRONI_LAG_CRIT)
+            lag_val   = node.get("lag_bytes")
+            lag_str   = "" if is_leader else (_fmt_lag(lag_val, PATRONI_LAG_WARN, PATRONI_LAG_CRIT) if lag_val else "")
             lines.append(
                 f"  {d_dot} {nfmt} {role_str}  "
                 f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{pend}"
