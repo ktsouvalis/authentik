@@ -663,6 +663,26 @@ class PatroniPanel(Static):
         if not d or "nodes" not in d:
             return "  [dim]Checking...[/]"
 
+        # Build slot suffix for the primary line (only warn/crit slots shown)
+        slots = d.get("slots")
+        slot_suffix = ""
+        if slots:
+            warn_parts = []
+            for s in slots:
+                lag  = s.get("lag_bytes", 0) or 0
+                act  = s["active"]
+                if not act and lag >= SLOT_CRIT_BYTES:
+                    color = "bold red"
+                elif not act or lag >= SLOT_WARN_BYTES:
+                    color = "yellow"
+                else:
+                    continue
+                warn_parts.append(
+                    f"[{color}]{s['name']}[/]([{color}]{_fmt_bytes(lag)}[/])"
+                )
+            if warn_parts:
+                slot_suffix = "  [dim]slots:[/] " + "  ".join(warn_parts)
+
         lines = []
         for node in d["nodes"]:
             name = node["name"]
@@ -679,56 +699,11 @@ class PatroniPanel(Static):
             nfmt      = f"[bold green]{name:<14}[/]" if is_leader else f"[dim white]{name:<14}[/]"
             lag_val   = node.get("lag_bytes")
             lag_str   = "" if is_leader else (_fmt_lag(lag_val, PATRONI_LAG_WARN, PATRONI_LAG_CRIT) if lag_val else "")
+            extra     = (slot_suffix + pend) if is_leader else pend
             lines.append(
                 f"  {d_dot} {nfmt} {role_str}  "
-                f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{pend}"
+                f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{extra}"
             )
-
-        # Last failover from /history
-        hist = d.get("history") or {}
-        if hist:
-            raw_ts = hist.get("timestamp") or ""
-            if raw_ts:
-                try:
-                    ts_display = datetime.fromisoformat(raw_ts).strftime("%Y-%m-%d %H:%M")
-                except ValueError:
-                    ts_display = raw_ts.replace("T", " ")[:16]
-            else:
-                ts_display = "unknown time"
-            reason = hist.get("reason", "unknown")
-            tl     = hist.get("timeline", "?")
-            lines.append(
-                f"  [dim]Last failover  TL {tl}  {ts_display}  →  {reason}[/]"
-            )
-
-        # Replication slots
-        slots = d.get("slots")
-        if slots is None and PG_PASS:
-            lines.append(f"  [dim]Slots: unavailable (psycopg2 missing)[/]")
-        elif slots is not None:
-            if not slots:
-                lines.append(f"  [dim]Slots: none[/]")
-            else:
-                any_warn = False
-                parts = []
-                for s in slots:
-                    lag   = s.get("lag_bytes", 0) or 0
-                    name  = s["name"]
-                    stype = s["type"][:4]
-                    act   = s["active"]
-                    lag_s = _fmt_bytes(lag)
-                    if not act and lag >= SLOT_CRIT_BYTES:
-                        color    = "bold red"
-                        any_warn = True
-                    elif not act or lag >= SLOT_WARN_BYTES:
-                        color    = "yellow"
-                        any_warn = True
-                    else:
-                        color = "dim white"
-                    act_s = "active" if act else "[red]INACTIVE[/]"
-                    parts.append(f"[{color}]{name}[/] ({stype},{act_s},[{color}]{lag_s}[/])")
-                dot = WARN if any_warn else GREY
-                lines.append(f"  {dot} [dim]slots:[/] {'  '.join(parts)}")
 
         return "\n".join(lines)
 
@@ -792,7 +767,13 @@ class HAProxyPanel(Static):
                 rate    = stats.get("rate", 0)
                 errs    = stats.get("errs", 0)
                 err_str = f"[red]5xx:{errs}[/]" if errs > 0 else "[dim]5xx:0[/]"
-                parts.append(f"[cyan]{pxname}[/]: {ups}/{total} {rate}/s {err_str}")
+                # only name specific servers when the whole backend is dark
+                if ups == 0:
+                    down_servers = [s["server"] for s in servers if s["status"] != "UP"]
+                    down_str = "".join(f" [red]↓{s}[/]" for s in down_servers)
+                else:
+                    down_str = ""
+                parts.append(f"[cyan]{pxname}[/]: {ups}/{total}{down_str} {rate}/s {err_str}")
             summary = "  ".join(parts) if parts else "[dim]no backends[/]"
             d_dot   = DOWN if any_zero else OK
             color   = "red" if any_zero else "green"
@@ -1068,6 +1049,14 @@ class ClusterMonitor(App):
         yield NginxPanel("  [dim]Checking...[/]",
                          id="panel-nginx", classes="panel")
 
+        yield AuthentikPanel("  [dim]Checking...[/]",
+                             id="panel-authentik", classes="panel")
+        yield WorkerQueuePanel("  [dim]Checking...[/]",
+                               id="panel-worker-queue", classes="panel")
+
+        yield HAProxyPanel("  [dim]Checking...[/]",
+                           id="panel-haproxy", classes="panel")
+
         with Horizontal(id="row-mid"):
             yield PatroniPanel("  [dim]Checking...[/]",
                                id="panel-patroni", classes="panel")
@@ -1079,13 +1068,6 @@ class ClusterMonitor(App):
                              id="panel-redis", classes="panel")
             yield SentinelPanel("  [dim]Checking...[/]",
                                 id="panel-sentinel", classes="panel")
-
-        yield HAProxyPanel("  [dim]Checking...[/]",
-                           id="panel-haproxy", classes="panel")
-        yield AuthentikPanel("  [dim]Checking...[/]",
-                             id="panel-authentik", classes="panel")
-        yield WorkerQueuePanel("  [dim]Checking...[/]",
-                               id="panel-worker-queue", classes="panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1209,8 +1191,22 @@ class ClusterMonitor(App):
             None,
         )
         tl_suffix = f"  TL={cluster_tl}" if cluster_tl else ""
+        if history_data:
+            raw_ts = history_data.get("timestamp") or ""
+            if raw_ts:
+                try:
+                    ts_display = datetime.fromisoformat(raw_ts).strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    ts_display = raw_ts.replace("T", " ")[:16]
+            else:
+                ts_display = "unknown time"
+            hist_tl = history_data.get("timeline", "?")
+            hist_reason = str(history_data.get("reason", "unknown"))[:40]
+            failover_part = f"  (last failover TL {hist_tl}  {ts_display}  →  {hist_reason})"
+        else:
+            failover_part = ""
         self.query_one("#panel-patroni").border_title = (
-            f" {failures_to_dot(patroni_fail)}  POSTGRESQL / PATRONI{tl_suffix}  "
+            f" {failures_to_dot(patroni_fail)}  POSTGRESQL / PATRONI{tl_suffix}{failover_part}  "
         )
         self.query_one("#panel-etcd").border_title = (
             f" {failures_to_dot(etcd_fail)}  ETCD CLUSTER  "
