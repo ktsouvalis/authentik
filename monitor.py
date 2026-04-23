@@ -586,20 +586,30 @@ class KeepalivedPanel(Static):
         self.update(self.render_content())
 
 
-def _fmt_lag(lag_bytes: Optional[int]) -> str:
+_MB = 1024 * 1024
+
+PATRONI_LAG_WARN = 1   * _MB   # yellow ≥ 1 MB
+PATRONI_LAG_CRIT = 100 * _MB   # red    ≥ 100 MB
+REDIS_LAG_WARN   = 1   * _MB   # yellow ≥ 1 MB
+REDIS_LAG_CRIT   = 10  * _MB   # red    ≥ 10 MB
+
+
+def _fmt_lag(lag_bytes: Optional[int],
+             warn_bytes: int = PATRONI_LAG_WARN,
+             crit_bytes: int = PATRONI_LAG_CRIT) -> str:
     """Format replication lag bytes into a coloured Rich string."""
     if lag_bytes is None:
         return ""
     if lag_bytes < 1024:
         val_str = f"{lag_bytes}B"
-    elif lag_bytes < 1024 * 1024:
+    elif lag_bytes < _MB:
         val_str = f"{lag_bytes // 1024}KB"
     else:
-        val_str = f"{lag_bytes // (1024 * 1024)}MB"
+        val_str = f"{lag_bytes // _MB}MB"
 
-    if lag_bytes > 100 * 1024 * 1024:
+    if lag_bytes >= crit_bytes:
         color = "bold red"
-    elif lag_bytes > 1024 * 1024:
+    elif lag_bytes >= warn_bytes:
         color = "yellow"
     else:
         color = "cyan"
@@ -655,7 +665,7 @@ class PatroniPanel(Static):
             d_dot     = OK if is_leader else GREY
             role_str  = "[bold green]LEADER[/]" if is_leader else "[dim white]REPLICA[/]"
             nfmt      = f"[bold green]{name:<14}[/]" if is_leader else f"[dim white]{name:<14}[/]"
-            lag_str   = "" if is_leader else _fmt_lag(node.get("lag_bytes"))
+            lag_str   = "" if is_leader else _fmt_lag(node.get("lag_bytes"), PATRONI_LAG_WARN, PATRONI_LAG_CRIT)
             lines.append(
                 f"  {d_dot} {nfmt} {role_str}  "
                 f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{pend}"
@@ -809,7 +819,7 @@ class RedisPanel(Static):
                 mlink = node.get("master_link_status", "?")
                 link_str = f"[green]{mlink}[/]" if mlink == "up" else f"[red]{mlink}[/]"
                 lag = replica_lags.get(node["ip"])
-                lag_str = _fmt_lag(lag) if lag else ""
+                lag_str = _fmt_lag(lag, REDIS_LAG_WARN, REDIS_LAG_CRIT) if lag else ""
                 lines.append(
                     f"  {GREY} [dim white]{name:<14}[/] [dim white]REPLICA[/]  "
                     f"master=[cyan]{mhost}[/]  link={link_str}{lag_str}"
