@@ -391,6 +391,14 @@ def check_sentinel_node(node: dict) -> dict:
                     d[k] = v
                 flags = d.get("flags", "")
                 ok = not any(f in flags for f in ("s_down", "o_down", "disconnected"))
+                if "o_down" in flags:
+                    master_status, status_color = "odown", "bold red"
+                elif "s_down" in flags:
+                    master_status, status_color = "sdown", "yellow"
+                elif "disconnected" in flags:
+                    master_status, status_color = "disconnected", "yellow"
+                else:
+                    master_status, status_color = "ok", "green"
                 return {
                     "ip": ip, "name": node.get("name", ip),
                     "ok": True, "sentinel_ok": ok,
@@ -398,20 +406,24 @@ def check_sentinel_node(node: dict) -> dict:
                     "master_port": d.get("port", "?"),
                     "num_slaves": d.get("num-slaves", "?"),
                     "num_sentinels": d.get("num-other-sentinels", "?"),
+                    "master_status": master_status,
+                    "status_color": status_color,
                     "flags": flags,
                 }
         return {
             "ip": ip, "name": node.get("name", ip),
             "ok": True, "sentinel_ok": True,
             "master_ip": "?", "master_port": "?",
-            "num_slaves": "?", "num_sentinels": "?", "flags": "",
+            "num_slaves": "?", "num_sentinels": "?",
+            "master_status": "ok", "status_color": "green", "flags": "",
         }
     except Exception:
         return {
             "ip": ip, "name": node.get("name", ip),
             "ok": False, "sentinel_ok": False,
             "master_ip": "?", "master_port": "?",
-            "num_slaves": "?", "num_sentinels": "?", "flags": "",
+            "num_slaves": "?", "num_sentinels": "?",
+            "master_status": "?", "status_color": "dim white", "flags": "",
         }
 
 
@@ -843,14 +855,22 @@ class SentinelPanel(Static):
             if not node["ok"]:
                 lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
                 continue
-            sok      = node.get("sentinel_ok", False)
-            d_dot    = OK if sok else WARN
-            color    = "green" if sok else "yellow"
+            mstatus = node.get("master_status", "?")
+            scolor  = node.get("status_color", "dim white")
+            if mstatus == "odown":
+                d_dot, ncolor = DOWN, "bold red"
+            elif mstatus in ("sdown", "disconnected"):
+                d_dot, ncolor = WARN, "yellow"
+            else:
+                d_dot, ncolor = OK, "bold green"
+            mip        = node.get("master_ip", "?")
+            mport      = node.get("master_port", "?")
+            status_str = f"  status=[{scolor}]{mstatus}[/]" if mstatus != "ok" else ""
             lines.append(
-                f"  {d_dot} [bold {color}]{name:<14}[/] "
-                f"master=[cyan]{node.get('master_ip','?')}[/]  "
+                f"  {d_dot} [{ncolor}]{name:<14}[/] "
+                f"master=[cyan]{mip}:{mport}[/]  "
                 f"replicas=[cyan]{node.get('num_slaves','?')}[/]  "
-                f"sentinels=[cyan]{node.get('num_sentinels','?')}[/]"
+                f"sentinels=[cyan]{node.get('num_sentinels','?')}[/]{status_str}"
             )
         return "\n".join(lines)
 
