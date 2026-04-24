@@ -874,7 +874,7 @@ class AuthentikPanel(Static):
             wk_str   = f"{OK} [green]worker[/]" if wk else f"{DOWN} [red]worker[/]"
             overall  = OK if (sv and wk) else (WARN if (sv or wk) else DOWN)
             color    = "green" if (sv and wk) else ("yellow" if (sv or wk) else "red")
-            lines.append(f"  {overall} [bold {color}]{name:<14}[/] {sv_str}   {wk_str}")
+            lines.append(f"  {overall} {name:<14} {sv_str}   {wk_str}")
         return "\n".join(lines)
 
     def watch_data(self, data: list) -> None:
@@ -953,7 +953,7 @@ class NginxPanel(Static):
             waiting = node["waiting"]
             busiest = max_active > 1 and active == max_active
             dot          = OK
-            name_fmt     = f"[bold green]{name:<14}[/]" if busiest else f"[green]{name:<14}[/]"
+            name_fmt     = f"[bold green]{name:<14}[/]" if busiest else f"{name:<14}"
             active_fmt   = f"[bold green]{active}[/]" if busiest else f"[bold cyan]{active}[/]"
             lines.append(
                 f"  {dot} {name_fmt} "
