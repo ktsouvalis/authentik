@@ -1,7 +1,11 @@
 # ak-monitor
 
-Real-time TUI dashboard for **Authentik HA Cluster** stack .
-Monitors all services on one screen: keepalived VIP, Patroni/PostgreSQL, etcd, HAProxy, Redis, Redis Sentinel, and Authentik backends.
+A pair of TUI tools for the **Authentik HA Cluster**:
+
+| Script | Purpose |
+|---|---|
+| `monitor.py` | Real-time dashboard — polls every 20 s, one panel per service |
+| `logs_viewer.py` | Log viewer — fetches warnings/errors from all nodes via SSH |
 
 Built with [Textual](https://textual.textualize.io/). No agents, no daemons — runs from any workstation that can reach the cluster network (or VXLAN interface).
 
@@ -75,7 +79,7 @@ pip install -r requirements.txt
 All settings are driven by configuration yaml variables. No config files to edit.
 
 ```bash
-cp config.example.yml config.yml
+cp config.yml.example config.yml
 nano config.yml     # fill in your IPs, passwords, node names
 ```
 
@@ -92,7 +96,7 @@ python monitor.py --config custom_config.yaml
 
 ---
 
-## Key bindings
+## Key bindings (monitor.py)
 
 | Key | Action |
 |---|---|
@@ -102,8 +106,85 @@ python monitor.py --config custom_config.yaml
 
 ---
 
+## log viewer (logs_viewer.py)
+
+Collects warnings and errors from the last 24 hours across every service and node via SSH. Bare-metal services are read from `journald`; containerised services are read from `docker logs`.
+
+### TUI mode
+
+Node tabs across the top; service sub-tabs within each node. Results stream in per service as SSH calls complete.
+
+```bash
+python3 logs_viewer.py
+python3 logs_viewer.py --config custom_config.yml
+```
+
+Key bindings:
+
+| Key | Action |
+|---|---|
+| `R` | Re-fetch all logs |
+| `Q` | Quit |
+
+### Save mode
+
+Fetches all logs and writes a structured plain-text `.log` file — no TUI is shown. Progress is printed to stdout as each result arrives. The `.log` extension is appended automatically if omitted.
+
+```bash
+python3 logs_viewer.py --save cluster_logs
+# writes: cluster_logs.log
+```
+
+Output format:
+
+```
+Authentik HA Cluster — Log Report
+Fetched:  2026-04-28 15:30:00
+Scope:    last 24h, warnings and errors only
+================================================================================
+
+NODE: ak-node-1  (10.99.97.71)
+================================================================================
+
+  SERVICE: Auth Server  [docker: authentik-server-1]
+  ────────────────────────────────────────────────────────────
+  2026-04-28 14:01:33 WARNING  …
+  2026-04-28 14:22:11 ERROR    …
+
+  SERVICE: Patroni  [systemd: patroni]
+  ────────────────────────────────────────────────────────────
+  (no warnings or errors in the last 24h)
+…
+```
+
+### Configuring services
+
+The list of services to poll is defined in `config.yml` under the `services:` key. Each entry specifies a display label, which node group it runs on, whether it is a Docker container or a systemd unit, and the container/unit name.
+
+```yaml
+services:
+  - label: "Auth Server"
+    nodes: authentik       # key from the nodes: or keepalived: sections
+    type: docker
+    container: "authentik-server-1"
+
+  - label: "Patroni"
+    nodes: patroni
+    type: systemd
+    unit: "patroni"
+```
+
+`nodes` must match one of the keys already present in the `nodes:` map (or `keepalived`). Services can be added, removed, or renamed here without touching the code.
+
+### Additional requirements for logs_viewer.py
+
+- SSH access to all cluster nodes (username + password in `config.yml` under `ssh:`)
+- Docker CLI available on each node (`docker logs`)
+- `systemd`/`journalctl` available on nodes running bare-metal services
+
+---
+
 ## Notes
 
 - Authentik TLS verification is disabled (`verify=False`) since the backends use self-signed or internal certs on port 9443. This is intentional and scoped to health check requests only.
 - The Sentinel check connects directly to each Sentinel node and reads `SENTINEL masters` — no VIP needed for Sentinel.
-- `NODE_NAMES` is optional. If omitted, raw IPs are displayed. Format: `IP=name` pairs comma-separated.

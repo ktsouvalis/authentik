@@ -74,6 +74,51 @@ ports:
   nginx_status: 8080
   postgres: 5432
 
+ssh:
+  username: "your_ssh_username"
+  password: "your_ssh_password"
+
+# Services to collect logs from.
+# type: "docker" (container name) or "systemd" (unit name)
+# nodes: key from the nodes/keepalived sections above that lists the target hosts
+services:
+  - label: "Auth Server"
+    nodes: authentik
+    type: docker
+    container: "authentik-server-1"
+  - label: "Auth Worker"
+    nodes: authentik
+    type: docker
+    container: "authentik-worker-1"
+  - label: "Patroni"
+    nodes: patroni
+    type: systemd
+    unit: "patroni"
+  - label: "etcd"
+    nodes: etcd
+    type: docker
+    container: "etcd"
+  - label: "HAProxy"
+    nodes: haproxy
+    type: docker
+    container: "haproxy"
+  - label: "Nginx"
+    nodes: authentik
+    type: docker
+    container: "nginx"
+  - label: "Keepalived"
+    nodes: keepalived
+    type: systemd
+    unit: "keepalived"
+  - label: "Redis"
+    nodes: redis
+    type: docker
+    container: "redis"
+  - label: "Sentinel"
+    nodes: redis
+    type: docker
+    container: "sentinel"
+
 credentials:
   haproxy_stats_user: "admin"
   haproxy_stats_pass: "your_haproxy_stats_password"

@@ -2,3 +2,4 @@ config.yml
 /.vscode/
 /.claude
 /__pycache__/
+*.log
