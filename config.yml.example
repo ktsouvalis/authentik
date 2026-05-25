@@ -76,7 +76,7 @@ ports:
 
 ssh:
   username: "your_ssh_username"
-  password: "your_ssh_password"
+  key_file: "~/.ssh/id_ed25519"
 
 # Services to collect logs from.
 # type: "docker" (container name) or "systemd" (unit name)

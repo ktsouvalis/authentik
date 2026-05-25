@@ -12,6 +12,7 @@ Usage:
   conda run -n authentik python3 logs_viewer.py [--config config.yml]
   conda run -n authentik python3 logs_viewer.py --save cluster_logs.txt
 """
+import os
 import re
 import sys
 import argparse
@@ -99,10 +100,10 @@ def systemd_log_cmd(unit):
     )
 
 
-def ssh_run(ip, user, password, cmd, timeout=30):
+def ssh_run(ip, user, key_file, cmd, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(ip, username=user, password=password, timeout=10, auth_timeout=10)
+    client.connect(ip, username=user, key_filename=os.path.expanduser(key_file), timeout=10, auth_timeout=10)
     try:
         _, stdout, _ = client.exec_command(cmd, timeout=timeout)
         return stdout.read().decode("utf-8", errors="replace").strip()
@@ -125,7 +126,7 @@ def colorize(line):
 def run_save(config, services, filename):
     node_map = build_node_map(config, services)
     ssh_user = config["ssh"]["username"]
-    ssh_pass = config["ssh"]["password"]
+    ssh_key = config["ssh"]["key_file"]
 
     tasks = [
         (node_name, info["ip"], label, src_type, identifier)
@@ -139,7 +140,7 @@ def run_save(config, services, filename):
         node_name, ip, label, src_type, identifier = task
         cmd = docker_log_cmd(identifier) if src_type == "docker" else systemd_log_cmd(identifier)
         try:
-            output = ssh_run(ip, ssh_user, ssh_pass, cmd)
+            output = ssh_run(ip, ssh_user, ssh_key, cmd)
             return (node_name, label), output, None
         except Exception as exc:
             return (node_name, label), "", str(exc)
@@ -197,7 +198,7 @@ class LogsApp(App):
         super().__init__()
         self.config = config
         self.ssh_user = config["ssh"]["username"]
-        self.ssh_pass = config["ssh"]["password"]
+        self.ssh_key = config["ssh"]["key_file"]
         self._node_map = build_node_map(config, services)
 
     def compose(self) -> ComposeResult:
@@ -239,7 +240,7 @@ class LogsApp(App):
             node_name, ip, label, src_type, identifier = task
             cmd = docker_log_cmd(identifier) if src_type == "docker" else systemd_log_cmd(identifier)
             try:
-                output = ssh_run(ip, self.ssh_user, self.ssh_pass, cmd)
+                output = ssh_run(ip, self.ssh_user, self.ssh_key, cmd)
                 return node_name, label, output, None
             except Exception as exc:
                 return node_name, label, "", str(exc)
