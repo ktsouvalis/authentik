@@ -3,3 +3,4 @@ config.yml
 /.claude
 /__pycache__/
 *.log
+venv/
