@@ -1,4 +1,5 @@
-config.yml
+*.yml
+*.csv
 /.vscode/
 /.claude
 /__pycache__/

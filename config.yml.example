@@ -119,11 +119,14 @@ services:
     type: docker
     container: "sentinel"
 
+authentik:
+  url: "https://authentik.example.com"   # Base URL of your Authentik instance (used by import_users.py)
+
 credentials:
   haproxy_stats_user: "admin"
   haproxy_stats_pass: "your_haproxy_stats_password"
   redis_password: "your_redis_password"
-  authentik_api_token: ""
+  authentik_api_token: ""                # API token for import_users.py and monitor
   postgres_user: "postgres"
   postgres_password: "your_postgres_password"
 
