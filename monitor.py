@@ -436,8 +436,8 @@ def check_authentik_node(node: dict) -> dict:
     except Exception:
         server_ok = False
     try:
-        r2 = requests.get(f"https://{ip}:{P_AUTHENTIK}/-/health/ready/",
-                          timeout=HTTP_TIMEOUT, verify=False)
+        r2 = requests.get(f"http://{ip}:9080/-/health/live/",
+                          timeout=HTTP_TIMEOUT)
         worker_ok = r2.status_code in (200, 204)
     except Exception:
         worker_ok = False
