@@ -12,6 +12,7 @@ Usage:
   conda run -n authentik python3 logs_viewer.py [--config config.yml]
   conda run -n authentik python3 logs_viewer.py --save cluster_logs.txt
 """
+import getpass
 import os
 import re
 import sys
@@ -25,7 +26,6 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, TabbedContent, TabPane, RichLog
 from textual import work
 
-LOG_HOURS = 24
 MAX_LINES = 500
 
 CSS = """\
@@ -85,25 +85,43 @@ def build_node_map(config, services):
     return node_map
 
 
-def docker_log_cmd(container):
+def docker_log_cmd(container, hours):
     return (
-        f"docker logs --since {LOG_HOURS}h {container} 2>&1"
+        f"docker logs --since {hours}h {container} 2>&1"
         f" | grep -iE '(WARN|WARNING|ERROR|CRITICAL|FATAL|CRIT)'"
         f" | tail -{MAX_LINES}"
     )
 
 
-def systemd_log_cmd(unit):
+def systemd_log_cmd(unit, hours):
     return (
-        f"journalctl -u {unit} --since '{LOG_HOURS} hours ago'"
+        f"journalctl -u {unit} --since '{hours} hours ago'"
         f" --no-pager -p warning -o short-iso | tail -{MAX_LINES}"
     )
 
 
-def ssh_run(ip, user, key_file, cmd, timeout=30):
+def load_ssh_key(key_file):
+    path = os.path.expanduser(key_file)
+    for key_class in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+        try:
+            return key_class.from_private_key_file(path)
+        except paramiko.PasswordRequiredException:
+            passphrase = getpass.getpass(f"SSH key passphrase for {key_file}: ")
+            for kc in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+                try:
+                    return kc.from_private_key_file(path, password=passphrase)
+                except paramiko.SSHException:
+                    continue
+            raise RuntimeError(f"Could not load SSH key with the provided passphrase: {key_file}")
+        except paramiko.SSHException:
+            continue
+    raise RuntimeError(f"Could not load SSH key: {key_file}")
+
+
+def ssh_run(ip, user, pkey, cmd, timeout=30):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(ip, username=user, key_filename=os.path.expanduser(key_file), timeout=10, auth_timeout=10)
+    client.connect(ip, username=user, pkey=pkey, timeout=10, auth_timeout=10)
     try:
         _, stdout, _ = client.exec_command(cmd, timeout=timeout)
         return stdout.read().decode("utf-8", errors="replace").strip()
@@ -123,10 +141,10 @@ def colorize(line):
 
 # ─── Save mode ───────────────────────────────────────────────────────────────
 
-def run_save(config, services, filename):
+def run_save(config, services, filename, hours):
     node_map = build_node_map(config, services)
     ssh_user = config["ssh"]["username"]
-    ssh_key = config["ssh"]["key_file"]
+    ssh_key = load_ssh_key(config["ssh"]["key_file"])
 
     tasks = [
         (node_name, info["ip"], label, src_type, identifier)
@@ -138,7 +156,7 @@ def run_save(config, services, filename):
 
     def fetch_one(task):
         node_name, ip, label, src_type, identifier = task
-        cmd = docker_log_cmd(identifier) if src_type == "docker" else systemd_log_cmd(identifier)
+        cmd = docker_log_cmd(identifier, hours) if src_type == "docker" else systemd_log_cmd(identifier, hours)
         try:
             output = ssh_run(ip, ssh_user, ssh_key, cmd)
             return (node_name, label), output, None
@@ -163,7 +181,7 @@ def run_save(config, services, filename):
     with open(filename, "w") as f:
         f.write("Authentik HA Cluster — Log Report\n")
         f.write(f"Fetched:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Scope:    last {LOG_HOURS}h, warnings and errors only\n")
+        f.write(f"Scope:    last {hours}h, warnings and errors only\n")
         f.write("=" * 80 + "\n")
 
         for node_name, info in node_map.items():
@@ -188,17 +206,18 @@ def run_save(config, services, filename):
 
 class LogsApp(App):
     CSS = CSS
-    TITLE = "Authentik HA – Logs (warn/error, last 24h)"
+    TITLE = "Authentik HA – Logs (warn/error)"
     BINDINGS = [
         ("r", "refresh_logs", "Refresh"),
         ("q", "quit", "Quit"),
     ]
 
-    def __init__(self, config, services):
+    def __init__(self, config, services, hours):
         super().__init__()
         self.config = config
         self.ssh_user = config["ssh"]["username"]
-        self.ssh_key = config["ssh"]["key_file"]
+        self.ssh_key = load_ssh_key(config["ssh"]["key_file"])
+        self._hours = hours
         self._node_map = build_node_map(config, services)
 
     def compose(self) -> ComposeResult:
@@ -238,7 +257,7 @@ class LogsApp(App):
 
         def fetch_one(task):
             node_name, ip, label, src_type, identifier = task
-            cmd = docker_log_cmd(identifier) if src_type == "docker" else systemd_log_cmd(identifier)
+            cmd = docker_log_cmd(identifier, self._hours) if src_type == "docker" else systemd_log_cmd(identifier, self._hours)
             try:
                 output = ssh_run(ip, self.ssh_user, self.ssh_key, cmd)
                 return node_name, label, output, None
@@ -272,6 +291,7 @@ class LogsApp(App):
 def main():
     parser = argparse.ArgumentParser(description="Authentik HA cluster log viewer")
     parser.add_argument("--config", default="config.yml", help="Path to config file")
+    parser.add_argument("--last", type=int, default=24, metavar="HOURS", help="Hours of logs to fetch (default: 24)")
     parser.add_argument("--save", metavar="FILE", help="Save logs to FILE as plain text (no TUI)")
     args = parser.parse_args()
 
@@ -285,9 +305,9 @@ def main():
 
     if args.save:
         save_path = args.save if args.save.endswith(".log") else args.save + ".log"
-        run_save(config, services, save_path)
+        run_save(config, services, save_path, args.last)
     else:
-        LogsApp(config, services).run()
+        LogsApp(config, services, args.last).run()
 
 
 if __name__ == "__main__":
