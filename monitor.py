@@ -174,12 +174,20 @@ def check_patroni_node(node: dict) -> dict:
             replayed = xlog.get("replayed_location")
             if received is not None and replayed is not None:
                 lag_bytes = max(0, received - replayed)
+        # A leader should be "running"; a replica should be "streaming".
+        # Anything else (e.g. stuck "starting" after a timeline mismatch /
+        # crash loop) is a real problem even though Patroni still answers.
+        healthy = (
+            (is_leader and state == "running")
+            or (not is_leader and state == "streaming")
+        )
         return {
             "ip": ip,
             "name": node.get("name", ip),
             "ok": True,
             "role": role,
             "state": state,
+            "healthy": healthy,
             "timeline": tl_str,
             "pending_restart": data.get("pending_restart", False),
             "lag_bytes": lag_bytes,
@@ -188,6 +196,7 @@ def check_patroni_node(node: dict) -> dict:
         return {
             "ip": ip, "name": node.get("name", ip),
             "ok": False, "role": "down", "state": "unreachable",
+            "healthy": False,
             "timeline": "—", "pending_restart": False,
             "lag_bytes": None,
         }
@@ -435,14 +444,8 @@ def check_authentik_node(node: dict) -> dict:
         server_ok = r.status_code in (200, 204)
     except Exception:
         server_ok = False
-    try:
-        r2 = requests.get(f"http://{ip}:9080/-/health/live/",
-                          timeout=HTTP_TIMEOUT)
-        worker_ok = r2.status_code in (200, 204)
-    except Exception:
-        worker_ok = False
     return {"ip": ip, "name": node.get("name", ip),
-            "server_ok": server_ok, "worker_ok": worker_ok}
+            "server_ok": server_ok}
 
 
 def check_authentik_task_queue() -> dict:
@@ -478,6 +481,56 @@ def check_authentik_task_queue() -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+def check_authentik_workers() -> dict:
+    """
+    /api/v3/tasks/workers/ — workers currently connected via the broker
+    heartbeat. Same number as the admin 'Workers' widget, and the ONLY
+    reliable signal a worker is actually consuming tasks. The :9080
+    /-/health/live/ probe is the Rust/axum liveness server and stays 200
+    even when the dramatiq consumer is dead — never judge worker health from it.
+
+    worker_id format is "<uuid>@<hostname>", so we map each connection back
+    to its node and flag any node with zero connected workers.
+    """
+    expected = [n.get("name", n["ip"]) for n in AK_NODES]
+    if not AUTHENTIK_API_TOKEN:
+        return {"ok": None, "error": "no API token configured",
+                "count": 0, "expected": len(expected),
+                "present": [], "missing": expected, "mismatched": []}
+    try:
+        r = requests.get(
+            f"https://{VIP}:{P_AUTHENTIK}/api/v3/tasks/workers/",
+            headers={"Authorization": f"Bearer {AUTHENTIK_API_TOKEN}"},
+            timeout=HTTP_TIMEOUT, verify=False,
+        )
+        if r.status_code in (401, 403):
+            return {"ok": False, "error": "unauthorized — token needs admin perms",
+                    "count": 0, "expected": len(expected),
+                    "present": [], "missing": expected, "mismatched": []}
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code}",
+                    "count": 0, "expected": len(expected),
+                    "present": [], "missing": expected, "mismatched": []}
+
+        workers = r.json() if isinstance(r.json(), list) else []
+        present, mismatched = [], []
+        for w in workers:
+            wid  = w.get("worker_id", "")
+            node = wid.split("@", 1)[1] if "@" in wid else wid
+            present.append(node)
+            if w.get("version_matching") is False:
+                mismatched.append(node)
+
+        missing = [n for n in expected if n not in present]
+        return {
+            "ok": True, "error": None,
+            "count": len(workers), "expected": len(expected),
+            "present": present, "missing": missing, "mismatched": mismatched,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e),
+                "count": 0, "expected": len(expected),
+                "present": [], "missing": expected, "mismatched": []}
 
 def check_nginx_status(node: dict) -> dict:
     ip = node["ip"]
@@ -694,15 +747,20 @@ class PatroniPanel(Static):
             tl    = node["timeline"]
             pend  = " [yellow](restart pending)[/]" if node.get("pending_restart") else ""
             is_leader = role in ("primary", "master")
-            d_dot     = OK if is_leader else GREY
+            healthy   = node.get("healthy", is_leader and state == "running")
+            if is_leader:
+                d_dot = OK if healthy else WARN
+            else:
+                d_dot = GREY if healthy else WARN
             role_str  = "[bold green]LEADER[/]" if is_leader else "[dim white]REPLICA[/]"
             nfmt      = f"[bold green]{name:<14}[/]" if is_leader else f"[dim white]{name:<14}[/]"
             lag_val   = node.get("lag_bytes")
             lag_str   = "" if is_leader else (_fmt_lag(lag_val, PATRONI_LAG_WARN, PATRONI_LAG_CRIT) if lag_val else "")
+            stuck_str = "" if healthy else "  [bold yellow]⚠ stuck (not streaming)[/]"
             extra     = (slot_suffix + pend) if is_leader else pend
             lines.append(
                 f"  {d_dot} {nfmt} {role_str}  "
-                f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{extra}"
+                f"state=[cyan]{state}[/]  TL=[cyan]{tl}[/]{lag_str}{extra}{stuck_str}"
             )
 
         return "\n".join(lines)
@@ -869,17 +927,39 @@ class AuthentikPanel(Static):
         for node in self.data:
             name = node["name"]
             sv   = node.get("server_ok", False)
-            wk   = node.get("worker_ok", False)
             sv_str   = f"{OK} [green]server[/]" if sv else f"{DOWN} [red]server[/]"
-            wk_str   = f"{OK} [green]worker[/]" if wk else f"{DOWN} [red]worker[/]"
-            overall  = OK if (sv and wk) else (WARN if (sv or wk) else DOWN)
-            color    = "green" if (sv and wk) else ("yellow" if (sv or wk) else "red")
-            lines.append(f"  {overall} {name:<14} {sv_str}   {wk_str}")
+            overall = OK if sv else DOWN
+            lines.append(f"  {overall} {name:<14} {sv_str}")
         return "\n".join(lines)
 
     def watch_data(self, data: list) -> None:
         self.update(self.render_content())
 
+class WorkersPanel(Static):
+    data: reactive[dict] = reactive({})
+
+    def render_content(self) -> str:
+        d = self.data
+        if not d:
+            return "  [dim]Checking...[/]"
+        if d.get("ok") is None:
+            return f"  {GREY} [dim]No API token — set credentials.authentik_api_token[/]"
+        if d.get("ok") is False:
+            return f"  {DOWN} [bold red]ERROR:[/] {d.get('error','unknown')}"
+
+        count, expected = d["count"], d["expected"]
+        missing, mism   = d["missing"], d["mismatched"]
+        if missing:
+            dot, color, state = DOWN, "red", f"[bold red]{count}/{expected}[/] — missing: " + ", ".join(missing)
+        elif mism:
+            dot, color, state = WARN, "yellow", f"[yellow]{count}/{expected}[/] — version mismatch: " + ", ".join(mism)
+        else:
+            dot, color, state = OK, "green", f"[bold green]{count}/{expected} connected[/]"
+        present = "  ".join(f"[cyan]{n}[/]" for n in d["present"]) or "[dim]none[/]"
+        return f"  {dot} [{color}]workers[/] {state}\n    [dim]present:[/] {present}"
+
+    def watch_data(self, data: dict) -> None:
+        self.update(self.render_content())
 
 class WorkerQueuePanel(Static):
     data: reactive[dict] = reactive({})
@@ -1051,6 +1131,8 @@ class ClusterMonitor(App):
 
         yield AuthentikPanel("  [dim]Checking...[/]",
                              id="panel-authentik", classes="panel")
+        yield WorkersPanel("  [dim]Checking...[/]",
+                           id="panel-workers", classes="panel")
         yield WorkerQueuePanel("  [dim]Checking...[/]",
                                id="panel-worker-queue", classes="panel")
 
@@ -1080,6 +1162,7 @@ class ClusterMonitor(App):
         self.query_one("#panel-haproxy").border_title        = f" {GREY}  HAPROXY BACKENDS  "
         self.query_one("#panel-authentik").border_title     = f" {GREY}  AUTHENTIK BACKENDS  "
         self.query_one("#panel-worker-queue").border_title  = f" {GREY}  AUTHENTIK WORKER QUEUE  "
+        self.query_one("#panel-workers").border_title       = f" {GREY}  AUTHENTIK WORKERS  "
 
         self.set_interval(REFRESH_INTERVAL, self.action_refresh_now)
         self.action_refresh_now()
@@ -1097,6 +1180,7 @@ class ClusterMonitor(App):
             f_authentik    = [ex.submit(check_authentik_node, n) for n in AK_NODES]
             f_nginx        = [ex.submit(check_nginx_status,   n) for n in KA_NODES]
             f_worker_queue = ex.submit(check_authentik_task_queue)
+            f_workers      = ex.submit(check_authentik_workers)
 
             # Patroni results needed first to identify the primary for dependent queries
             patroni_data = [f.result() for f in f_patroni]
@@ -1117,6 +1201,7 @@ class ClusterMonitor(App):
             sentinel_data     = [f.result() for f in f_sentinel]
             authentik_data    = [f.result() for f in f_authentik]
             nginx_data        = [f.result() for f in f_nginx]
+            workers_data      = f_workers.result()
             worker_queue_data = f_worker_queue.result()
 
             history_data = f_history.result() if f_history else {}
@@ -1130,7 +1215,7 @@ class ClusterMonitor(App):
             patroni_data, history_data, slots_data,
             etcd_data, haproxy_data,
             redis_data, sentinel_data, authentik_data,
-            nginx_data, worker_queue_data, ts,
+            nginx_data, worker_queue_data, workers_data, ts,
         )
 
     def _apply_updates(
@@ -1138,7 +1223,7 @@ class ClusterMonitor(App):
         patroni_data, history_data, slots_data,
         etcd_data, haproxy_data,
         redis_data, sentinel_data, authentik_data,
-        nginx_data, worker_queue_data, ts,
+        nginx_data, worker_queue_data, workers_data, ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
             "vip": vip_data, "nodes": ka_data
@@ -1155,26 +1240,31 @@ class ClusterMonitor(App):
         self.query_one("#panel-authentik",   AuthentikPanel).data    = authentik_data
         self.query_one("#panel-nginx",       NginxPanel).data        = nginx_data
         self.query_one("#panel-worker-queue",WorkerQueuePanel).data  = worker_queue_data
+        self.query_one("#panel-workers", WorkersPanel).data = workers_data
 
         # --- per-service failure counts (out of 3 nodes) ---
         ka_fail       = sum(1 for n in ka_data       if not n["nginx_up"])
-        patroni_fail  = sum(1 for n in patroni_data  if not n["ok"])
+        patroni_fail = sum(
+            1 for n in patroni_data
+            if not n["ok"] or not n.get("healthy", True)
+        )
         etcd_fail     = sum(1 for n in etcd_data     if not n["ok"])
         haproxy_fail  = sum(1 for n in haproxy_data  if not n["ok"])
         redis_fail    = sum(1 for n in redis_data    if not n["ok"])
         sentinel_fail = sum(1 for n in sentinel_data if not n["ok"])
         authentik_fail = sum(
-            1 for n in authentik_data if not (n["server_ok"] and n["worker_ok"])
+            1 for n in authentik_data if not (n["server_ok"])
         )
         wq = worker_queue_data
         wq_fail = (
             1 if wq.get("ok") is False
             else (1 if wq.get("error", 0) > 0 else 0)
         )
+        workers_fail = 1 if workers_data.get("ok") is False or workers_data.get("missing") else 0
 
         all_failures = [
             ka_fail, patroni_fail, etcd_fail, haproxy_fail,
-            redis_fail, sentinel_fail, authentik_fail, wq_fail,
+            redis_fail, sentinel_fail, authentik_fail, wq_fail, workers_fail
         ]
 
         # --- update border titles with per-service dot ---
@@ -1231,6 +1321,17 @@ class ClusterMonitor(App):
         )
         self.query_one("#panel-worker-queue").border_title = (
             f" {wq_dot}  AUTHENTIK WORKER QUEUE  "
+        )
+
+        wkr = workers_data
+        workers_dot = (
+            GREY if wkr.get("ok") is None
+            else DOWN if wkr.get("ok") is False or wkr.get("missing")
+            else WARN if wkr.get("mismatched")
+            else OK
+        )
+        self.query_one("#panel-workers").border_title = (
+            f" {workers_dot}  AUTHENTIK WORKERS  "
         )
 
         # --- central dot in title bar ---
