@@ -392,12 +392,22 @@ def check_sentinel_node(node: dict) -> dict:
         s.close()
         if masters:
             m = masters[0]
-            if isinstance(m, list):
-                d = {}
+            d = {}
+            if isinstance(m, dict):
+                # Newer redis-py / RESP3: each master is already a dict.
+                # Keys/values may still be bytes depending on decode_responses.
+                for k, v in m.items():
+                    kk = k.decode() if isinstance(k, bytes) else k
+                    vv = v.decode() if isinstance(v, bytes) else v
+                    d[kk] = vv
+            elif isinstance(m, list):
+                # Older redis-py / RESP2: flat [k1, v1, k2, v2, ...] list.
                 for i in range(0, len(m) - 1, 2):
                     k = m[i].decode() if isinstance(m[i], bytes) else m[i]
                     v = m[i+1].decode() if isinstance(m[i+1], bytes) else m[i+1]
                     d[k] = v
+
+            if d:
                 flags = d.get("flags", "")
                 ok = not any(f in flags for f in ("s_down", "o_down", "disconnected"))
                 if "o_down" in flags:
@@ -434,7 +444,6 @@ def check_sentinel_node(node: dict) -> dict:
             "num_slaves": "?", "num_sentinels": "?",
             "master_status": "?", "status_color": "dim white", "flags": "",
         }
-
 
 def check_authentik_node(node: dict) -> dict:
     ip = node["ip"]
