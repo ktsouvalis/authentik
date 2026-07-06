@@ -19,8 +19,6 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 | **HAProxy backends** | Parses `/stats;csv` — shows per-backend UP/DOWN count per node |
 | **PostgreSQL / Patroni** | `GET http://<node>:8008/` — role (LEADER/REPLICA), state, timeline |
 | **etcd** | `GET http://<node>:2379/health` + `/v2/stats/self` — health + leader |
-| **Redis** | `INFO replication` via redis-py — MASTER/REPLICA, slave count, master link |
-| **Redis Sentinel** | `SENTINEL masters` — master IP, replica count, sentinel quorum |
 | **Authentik** | `/-/health/live/` and `/-/health/ready/` — server + worker per node |
 
 ---
@@ -31,7 +29,7 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 |---|---|
 | ${\color{green}●}$ Green | Service is up and in primary/active/leader role |
 | ${\color{gray}●}$ Grey | Service is up but in backup/replica/follower role (healthy, non-primary) |
-| ${\color{yellow}●}$ Yellow | Degraded — partial backends UP or sentinel flags set |
+| ${\color{yellow}●}$ Yellow | Degraded — partial backends UP |
 | ${\color{red}●}$ Red | Service is down or unreachable |
 | ${\color{green}●}$ Top banner green | All services across all nodes are healthy |
 | ${\color{red}●}$ Top banner red | One or more services are down |
@@ -45,7 +43,6 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 - HAProxy stats endpoint enabled (port 9000 by default)
 - Patroni REST API accessible (port 8008)
 - etcd HTTP API accessible (port 2379)
-- Redis and Sentinel ports reachable (6379, 26379)
 - Authentik HTTPS accessible on port 9443 per node
 
 ---
@@ -184,7 +181,19 @@ services:
 
 ---
 
+## Importing users
+
+`import_users.py` bulk-imports users into Authentik from a CSV file (columns: surname, name, and an email column — the header just needs to contain `@` somewhere). It reads the Authentik URL and API token from `config.yml`, creates missing users, updates emails on existing ones, and optionally adds everyone to a group.
+
+```bash
+python3 import_users.py users.csv
+python3 import_users.py users.csv --group "Lab Members"
+python3 import_users.py users.csv --dry-run
+python3 import_users.py users.csv --config config.site-b.yml
+```
+
+---
+
 ## Notes
 
 - Authentik TLS verification is disabled (`verify=False`) since the backends use self-signed or internal certs on port 9443. This is intentional and scoped to health check requests only.
-- The Sentinel check connects directly to each Sentinel node and reads `SENTINEL masters` — no VIP needed for Sentinel.

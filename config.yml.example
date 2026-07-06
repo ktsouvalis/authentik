@@ -13,9 +13,8 @@ unicode_bullets: true
 # Auto-refresh interval in seconds
 refresh_interval: 20
 
-# HTTP and Redis timeouts in seconds
+# HTTP timeout in seconds
 http_timeout: 5
-redis_timeout: 3
 
 # VIP managed by keepalived
 vip: "<your VIP>"
@@ -56,21 +55,11 @@ nodes:
     - ip: "<node-3-ip>"
       name: "ak-node-3"
 
-  redis:
-    - ip: "<node-4-ip>"
-      name: "ak-node-4"
-    - ip: "<node-5-ip>"
-      name: "ak-node-5"
-    - ip: "<node-6-ip>"
-      name: "ak-node-6"
-
 ports:
   authentik: 9443
   patroni: 8008
   etcd: 2379
   haproxy_stats: 9000
-  redis: 6379
-  sentinel: 26379
   nginx_status: 8080
   postgres: 5432
 
@@ -110,14 +99,6 @@ services:
     nodes: keepalived
     type: systemd
     unit: "keepalived"
-  - label: "Redis"
-    nodes: redis
-    type: docker
-    container: "redis"
-  - label: "Sentinel"
-    nodes: redis
-    type: docker
-    container: "sentinel"
 
 authentik:
   url: "https://authentik.example.com"   # Base URL of your Authentik instance (used by import_users.py)
@@ -125,13 +106,9 @@ authentik:
 credentials:
   haproxy_stats_user: "admin"
   haproxy_stats_pass: "your_haproxy_stats_password"
-  redis_password: "your_redis_password"
   authentik_api_token: ""                # API token for import_users.py and monitor
   postgres_user: "postgres"
   postgres_password: "your_postgres_password"
-
-sentinel:
-  master_name: "mymaster"
 
 keepalived:
   # Base priorities per node — must match your keepalived.conf

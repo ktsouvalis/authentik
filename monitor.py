@@ -24,7 +24,6 @@ except ImportError:
 
 import yaml
 import requests
-import redis as redis_lib
 import urllib3
 
 from textual.app import App, ComposeResult
@@ -56,13 +55,11 @@ CFG = load_config(CONFIG_PATH)
 SITE_NAME         = CFG.get("site_name", "Authentik HA Cluster")
 REFRESH_INTERVAL  = int(CFG.get("refresh_interval", 30))
 HTTP_TIMEOUT      = int(CFG.get("http_timeout", 4))
-REDIS_TIMEOUT     = float(CFG.get("redis_timeout", 3))
 VIP               = CFG.get("vip", "")
 
 NODES             = CFG.get("nodes", {})
 PORTS             = CFG.get("ports", {})
 CREDS             = CFG.get("credentials", {})
-SENTINEL_CFG      = CFG.get("sentinel", {})
 KA_CFG            = CFG.get("keepalived", {})
 
 # Node lists
@@ -70,7 +67,6 @@ AK_NODES      = NODES.get("authentik", [])
 PATRONI_NODES = NODES.get("patroni", [])
 ETCD_NODES    = NODES.get("etcd", [])
 HAPROXY_NODES = NODES.get("haproxy", [])
-REDIS_NODES   = NODES.get("redis", [])
 KA_NODES      = KA_CFG.get("nodes", [])
 TRACK_WEIGHT  = int(KA_CFG.get("track_weight", -20))
 
@@ -79,18 +75,14 @@ P_AUTHENTIK   = int(PORTS.get("authentik", 9443))
 P_PATRONI     = int(PORTS.get("patroni", 8008))
 P_ETCD        = int(PORTS.get("etcd", 2379))
 P_HAPROXY     = int(PORTS.get("haproxy_stats", 9000))
-P_REDIS       = int(PORTS.get("redis", 6379))
-P_SENTINEL    = int(PORTS.get("sentinel", 26379))
 P_NGINX_STATUS = int(PORTS.get("nginx_status", 8080))
 
 # Credentials
 HAPROXY_USER        = CREDS.get("haproxy_stats_user", "admin")
 HAPROXY_PASS        = CREDS.get("haproxy_stats_pass", "")
-REDIS_PASS          = CREDS.get("redis_password", "")
 AUTHENTIK_API_TOKEN = CREDS.get("authentik_api_token", "")
 PG_USER             = CREDS.get("postgres_user", "postgres")
 PG_PASS             = CREDS.get("postgres_password", "")
-SENTINEL_NAME       = SENTINEL_CFG.get("master_name", "mymaster")
 
 P_POSTGRES          = int(PORTS.get("postgres", 5432))
 SLOT_WARN_BYTES     = 100 * 1024 * 1024   # 100 MB — yellow
@@ -331,120 +323,6 @@ def check_haproxy_node(node: dict) -> dict:
         return {"ip": ip, "name": node.get("name", ip), "ok": False, "backends": {}}
 
 
-def check_redis_node(node: dict) -> dict:
-    ip = node["ip"]
-    try:
-        r = redis_lib.Redis(
-            host=ip, port=P_REDIS,
-            password=REDIS_PASS or None,
-            socket_timeout=REDIS_TIMEOUT,
-            socket_connect_timeout=REDIS_TIMEOUT,
-        )
-        info_repl = r.info("replication")
-        info_mem  = r.info("memory")
-        r.close()
-        result = {
-            "ip": ip, "name": node.get("name", ip), "ok": True,
-            "role": info_repl.get("role", "unknown"),
-            "connected_slaves": info_repl.get("connected_slaves", 0),
-            "master_host": info_repl.get("master_host"),
-            "master_link_status": info_repl.get("master_link_status"),
-            "mem_used": info_mem.get("used_memory", 0),
-            "mem_max":  info_mem.get("maxmemory", 0),
-        }
-        if info_repl.get("role") == "master":
-            master_offset = info_repl.get("master_repl_offset", 0)
-            replica_lags: dict = {}
-            for key, val in info_repl.items():
-                if not key.startswith("slave"):
-                    continue
-                if isinstance(val, dict):
-                    slave_ip = val.get("ip")
-                    slave_offset = int(val.get("offset", master_offset))
-                elif isinstance(val, str):
-                    parts = dict(p.split("=") for p in val.split(",") if "=" in p)
-                    slave_ip = parts.get("ip")
-                    slave_offset = int(parts.get("offset", master_offset))
-                else:
-                    continue
-                if slave_ip:
-                    replica_lags[slave_ip] = max(0, master_offset - slave_offset)
-            result["replica_lags"] = replica_lags
-        return result
-    except Exception:
-        return {
-            "ip": ip, "name": node.get("name", ip), "ok": False,
-            "role": "down", "connected_slaves": 0,
-            "master_host": None, "master_link_status": None,
-            "mem_used": 0, "mem_max": 0,
-        }
-
-
-def check_sentinel_node(node: dict) -> dict:
-    ip = node["ip"]
-    try:
-        s = redis_lib.Redis(
-            host=ip, port=P_SENTINEL,
-            socket_timeout=REDIS_TIMEOUT,
-            socket_connect_timeout=REDIS_TIMEOUT,
-        )
-        masters = s.execute_command("SENTINEL", "masters")
-        s.close()
-        if masters:
-            m = masters[0]
-            d = {}
-            if isinstance(m, dict):
-                # Newer redis-py / RESP3: each master is already a dict.
-                # Keys/values may still be bytes depending on decode_responses.
-                for k, v in m.items():
-                    kk = k.decode() if isinstance(k, bytes) else k
-                    vv = v.decode() if isinstance(v, bytes) else v
-                    d[kk] = vv
-            elif isinstance(m, list):
-                # Older redis-py / RESP2: flat [k1, v1, k2, v2, ...] list.
-                for i in range(0, len(m) - 1, 2):
-                    k = m[i].decode() if isinstance(m[i], bytes) else m[i]
-                    v = m[i+1].decode() if isinstance(m[i+1], bytes) else m[i+1]
-                    d[k] = v
-
-            if d:
-                flags = d.get("flags", "")
-                ok = not any(f in flags for f in ("s_down", "o_down", "disconnected"))
-                if "o_down" in flags:
-                    master_status, status_color = "odown", "bold red"
-                elif "s_down" in flags:
-                    master_status, status_color = "sdown", "yellow"
-                elif "disconnected" in flags:
-                    master_status, status_color = "disconnected", "yellow"
-                else:
-                    master_status, status_color = "ok", "green"
-                return {
-                    "ip": ip, "name": node.get("name", ip),
-                    "ok": True, "sentinel_ok": ok,
-                    "master_ip": d.get("ip", "?"),
-                    "master_port": d.get("port", "?"),
-                    "num_slaves": d.get("num-slaves", "?"),
-                    "num_sentinels": d.get("num-other-sentinels", "?"),
-                    "master_status": master_status,
-                    "status_color": status_color,
-                    "flags": flags,
-                }
-        return {
-            "ip": ip, "name": node.get("name", ip),
-            "ok": True, "sentinel_ok": True,
-            "master_ip": "?", "master_port": "?",
-            "num_slaves": "?", "num_sentinels": "?",
-            "master_status": "ok", "status_color": "green", "flags": "",
-        }
-    except Exception:
-        return {
-            "ip": ip, "name": node.get("name", ip),
-            "ok": False, "sentinel_ok": False,
-            "master_ip": "?", "master_port": "?",
-            "num_slaves": "?", "num_sentinels": "?",
-            "master_status": "?", "status_color": "dim white", "flags": "",
-        }
-
 def check_authentik_node(node: dict) -> dict:
     ip = node["ip"]
     try:
@@ -664,8 +542,6 @@ _MB = 1024 * 1024
 
 PATRONI_LAG_WARN = 1   * _MB   # yellow ≥ 1 MB
 PATRONI_LAG_CRIT = 100 * _MB   # red    ≥ 100 MB
-REDIS_LAG_WARN   = 1   * _MB   # yellow ≥ 1 MB
-REDIS_LAG_CRIT   = 10  * _MB   # red    ≥ 10 MB
 
 
 def _fmt_lag(lag_bytes: Optional[int],
@@ -688,23 +564,6 @@ def _fmt_lag(lag_bytes: Optional[int],
     else:
         color = "cyan"
     return f"  lag=[{color}]{val_str}[/]"
-
-
-def _fmt_mem_bar(used: int, maxmem: int, width: int = 10) -> str:
-    """Format Redis memory usage as a coloured % bar."""
-    if maxmem <= 0:
-        if used < 1024 * 1024:
-            human = f"{used // 1024}KB"
-        elif used < 1024 ** 3:
-            human = f"{used // (1024 * 1024)}MB"
-        else:
-            human = f"{used / (1024 ** 3):.1f}GB"
-        return f"  mem=[cyan]{human}[/][dim]/∞[/]" if _UNICODE else f"  mem=[cyan]{human}[/][dim]/no-limit[/]"
-    pct    = min(100, used * 100 // maxmem)
-    filled = pct * width // 100
-    bar    = ("█" * filled + "░" * (width - filled)) if _UNICODE else ("=" * filled + "-" * (width - filled))
-    color  = "bold red" if pct >= 90 else ("yellow" if pct >= 70 else "green")
-    return f"  mem=[{color}]{pct}%[/] [{color}]{bar}[/]"
 
 
 def _fmt_bytes(n: int) -> str:
@@ -845,81 +704,6 @@ class HAProxyPanel(Static):
             d_dot   = DOWN if any_zero else OK
             color   = "red" if any_zero else "green"
             lines.append(f"  {d_dot} [bold {color}]{name:<14}[/] {summary}")
-        return "\n".join(lines)
-
-    def watch_data(self, data: list) -> None:
-        self.update(self.render_content())
-
-
-class RedisPanel(Static):
-    data: reactive[list] = reactive([])
-
-    def render_content(self) -> str:
-        if not self.data:
-            return "  [dim]Checking...[/]"
-        replica_lags: dict = {}
-        for node in self.data:
-            if node.get("role") == "master" and "replica_lags" in node:
-                replica_lags = node["replica_lags"]
-                break
-        lines = []
-        for node in self.data:
-            name = node["name"]
-            if not node["ok"]:
-                lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
-                continue
-            if node["role"] == "master":
-                slaves = node.get("connected_slaves", 0)
-                mem_str = _fmt_mem_bar(node.get("mem_used", 0), node.get("mem_max", 0))
-                lines.append(
-                    f"  {OK} [bold green]{name:<14}[/] [bold green]MASTER[/]  "
-                    f"slaves=[cyan]{slaves}[/]{mem_str}"
-                )
-            else:
-                mhost = node.get("master_host", "?")
-                mlink = node.get("master_link_status", "?")
-                link_str = f"[green]{mlink}[/]" if mlink == "up" else f"[red]{mlink}[/]"
-                lag = replica_lags.get(node["ip"])
-                lag_str = _fmt_lag(lag, REDIS_LAG_WARN, REDIS_LAG_CRIT) if lag else ""
-                lines.append(
-                    f"  {GREY} [dim white]{name:<14}[/] [dim white]REPLICA[/]  "
-                    f"master=[cyan]{mhost}[/]  link={link_str}{lag_str}"
-                )
-        return "\n".join(lines)
-
-    def watch_data(self, data: list) -> None:
-        self.update(self.render_content())
-
-
-class SentinelPanel(Static):
-    data: reactive[list] = reactive([])
-
-    def render_content(self) -> str:
-        if not self.data:
-            return "  [dim]Checking...[/]"
-        lines = []
-        for node in self.data:
-            name = node["name"]
-            if not node["ok"]:
-                lines.append(f"  {DOWN} [bold red]{name:<14}[/] [red]UNREACHABLE[/]")
-                continue
-            mstatus = node.get("master_status", "?")
-            scolor  = node.get("status_color", "dim white")
-            if mstatus == "odown":
-                d_dot, ncolor = DOWN, "bold red"
-            elif mstatus in ("sdown", "disconnected"):
-                d_dot, ncolor = WARN, "yellow"
-            else:
-                d_dot, ncolor = OK, "bold green"
-            mip        = node.get("master_ip", "?")
-            mport      = node.get("master_port", "?")
-            status_str = f"  status=[{scolor}]{mstatus}[/]" if mstatus != "ok" else ""
-            lines.append(
-                f"  {d_dot} [{ncolor}]{name:<14}[/] "
-                f"master=[cyan]{mip}:{mport}[/]  "
-                f"replicas=[cyan]{node.get('num_slaves','?')}[/]  "
-                f"sentinels=[cyan]{node.get('num_sentinels','?')}[/]{status_str}"
-            )
         return "\n".join(lines)
 
     def watch_data(self, data: list) -> None:
@@ -1153,12 +937,6 @@ class ClusterMonitor(App):
                                id="panel-patroni", classes="panel")
             yield EtcdPanel("  [dim]Checking...[/]",
                             id="panel-etcd", classes="panel")
-
-        with Horizontal(id="row-redis"):
-            yield RedisPanel("  [dim]Checking...[/]",
-                             id="panel-redis", classes="panel")
-            yield SentinelPanel("  [dim]Checking...[/]",
-                                id="panel-sentinel", classes="panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1166,8 +944,6 @@ class ClusterMonitor(App):
         self.query_one("#panel-nginx").border_title       = f" {GREY}  NGINX CONNECTIONS  "
         self.query_one("#panel-patroni").border_title     = f" {GREY}  POSTGRESQL / PATRONI  "
         self.query_one("#panel-etcd").border_title        = f" {GREY}  ETCD CLUSTER  "
-        self.query_one("#panel-redis").border_title       = f" {GREY}  REDIS  "
-        self.query_one("#panel-sentinel").border_title    = f" {GREY}  REDIS SENTINEL  "
         self.query_one("#panel-haproxy").border_title        = f" {GREY}  HAPROXY BACKENDS  "
         self.query_one("#panel-authentik").border_title     = f" {GREY}  AUTHENTIK BACKENDS  "
         self.query_one("#panel-worker-queue").border_title  = f" {GREY}  AUTHENTIK WORKER QUEUE  "
@@ -1184,8 +960,6 @@ class ClusterMonitor(App):
             f_patroni      = [ex.submit(check_patroni_node,   n) for n in PATRONI_NODES]
             f_etcd         = [ex.submit(check_etcd_node,      n) for n in ETCD_NODES]
             f_haproxy      = [ex.submit(check_haproxy_node,   n) for n in HAPROXY_NODES]
-            f_redis        = [ex.submit(check_redis_node,     n) for n in REDIS_NODES]
-            f_sentinel     = [ex.submit(check_sentinel_node,  n) for n in REDIS_NODES]
             f_authentik    = [ex.submit(check_authentik_node, n) for n in AK_NODES]
             f_nginx        = [ex.submit(check_nginx_status,   n) for n in KA_NODES]
             f_worker_queue = ex.submit(check_authentik_task_queue)
@@ -1206,8 +980,6 @@ class ClusterMonitor(App):
             ka_data           = [f.result() for f in f_ka]
             etcd_data         = [f.result() for f in f_etcd]
             haproxy_data      = [f.result() for f in f_haproxy]
-            redis_data        = [f.result() for f in f_redis]
-            sentinel_data     = [f.result() for f in f_sentinel]
             authentik_data    = [f.result() for f in f_authentik]
             nginx_data        = [f.result() for f in f_nginx]
             workers_data      = f_workers.result()
@@ -1223,7 +995,7 @@ class ClusterMonitor(App):
             vip_data, ka_data,
             patroni_data, history_data, slots_data,
             etcd_data, haproxy_data,
-            redis_data, sentinel_data, authentik_data,
+            authentik_data,
             nginx_data, worker_queue_data, workers_data, ts,
         )
 
@@ -1231,7 +1003,7 @@ class ClusterMonitor(App):
         self, vip_data, ka_data,
         patroni_data, history_data, slots_data,
         etcd_data, haproxy_data,
-        redis_data, sentinel_data, authentik_data,
+        authentik_data,
         nginx_data, worker_queue_data, workers_data, ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
@@ -1244,8 +1016,6 @@ class ClusterMonitor(App):
         }
         self.query_one("#panel-etcd",     EtcdPanel).data     = etcd_data
         self.query_one("#panel-haproxy",  HAProxyPanel).data  = haproxy_data
-        self.query_one("#panel-redis",    RedisPanel).data    = redis_data
-        self.query_one("#panel-sentinel", SentinelPanel).data = sentinel_data
         self.query_one("#panel-authentik",   AuthentikPanel).data    = authentik_data
         self.query_one("#panel-nginx",       NginxPanel).data        = nginx_data
         self.query_one("#panel-worker-queue",WorkerQueuePanel).data  = worker_queue_data
@@ -1259,8 +1029,6 @@ class ClusterMonitor(App):
         )
         etcd_fail     = sum(1 for n in etcd_data     if not n["ok"])
         haproxy_fail  = sum(1 for n in haproxy_data  if not n["ok"])
-        redis_fail    = sum(1 for n in redis_data    if not n["ok"])
-        sentinel_fail = sum(1 for n in sentinel_data if not n["ok"])
         authentik_fail = sum(
             1 for n in authentik_data if not (n["server_ok"])
         )
@@ -1273,7 +1041,7 @@ class ClusterMonitor(App):
 
         all_failures = [
             ka_fail, patroni_fail, etcd_fail, haproxy_fail,
-            redis_fail, sentinel_fail, authentik_fail, wq_fail, workers_fail
+            authentik_fail, wq_fail, workers_fail
         ]
 
         # --- update border titles with per-service dot ---
@@ -1309,12 +1077,6 @@ class ClusterMonitor(App):
         )
         self.query_one("#panel-etcd").border_title = (
             f" {failures_to_dot(etcd_fail)}  ETCD CLUSTER  "
-        )
-        self.query_one("#panel-redis").border_title = (
-            f" {failures_to_dot(redis_fail)}  REDIS  "
-        )
-        self.query_one("#panel-sentinel").border_title = (
-            f" {failures_to_dot(sentinel_fail)}  REDIS SENTINEL  "
         )
         self.query_one("#panel-haproxy").border_title = (
             f" {failures_to_dot(haproxy_fail)}  HAPROXY BACKENDS  "
