@@ -28,6 +28,17 @@ from textual import work
 
 MAX_LINES = 500
 
+# Each level includes everything at or above it in severity (matches
+# journalctl's own -p semantics: "info" shows info/warning/error, etc).
+# "debug" has no grep pattern — it means "don't filter, show everything".
+LOG_LEVELS = {
+    "debug": {"grep": None, "journalctl": "debug"},
+    "info": {"grep": r"(INFO|WARN|WARNING|ERROR|CRITICAL|FATAL|CRIT)", "journalctl": "info"},
+    "warning": {"grep": r"(WARN|WARNING|ERROR|CRITICAL|FATAL|CRIT)", "journalctl": "warning"},
+    "error": {"grep": r"(ERROR|CRITICAL|FATAL|CRIT)", "journalctl": "err"},
+}
+DEFAULT_LOG_LEVEL = "warning"
+
 CSS = """\
 Screen { background: $surface; }
 TabbedContent { height: 1fr; }
@@ -85,18 +96,19 @@ def build_node_map(config, services):
     return node_map
 
 
-def docker_log_cmd(container, hours):
-    return (
-        f"docker logs --since {hours}h {container} 2>&1"
-        f" | grep -iE '(WARN|WARNING|ERROR|CRITICAL|FATAL|CRIT)'"
-        f" | tail -{MAX_LINES}"
-    )
+def docker_log_cmd(container, hours, level=DEFAULT_LOG_LEVEL):
+    cmd = f"docker logs --since {hours}h {container} 2>&1"
+    pattern = LOG_LEVELS[level]["grep"]
+    if pattern:
+        cmd += f" | grep -iE '{pattern}'"
+    return cmd + f" | tail -{MAX_LINES}"
 
 
-def systemd_log_cmd(unit, hours):
+def systemd_log_cmd(unit, hours, level=DEFAULT_LOG_LEVEL):
+    priority = LOG_LEVELS[level]["journalctl"]
     return (
         f"journalctl -u {unit} --since '{hours} hours ago'"
-        f" --no-pager -p warning -o short-iso | tail -{MAX_LINES}"
+        f" --no-pager -p {priority} -o short-iso | tail -{MAX_LINES}"
     )
 
 
@@ -141,7 +153,7 @@ def colorize(line):
 
 # ─── Save mode ───────────────────────────────────────────────────────────────
 
-def run_save(config, services, filename, hours):
+def run_save(config, services, filename, hours, level=DEFAULT_LOG_LEVEL):
     node_map = build_node_map(config, services)
     ssh_user = config["ssh"]["username"]
     ssh_key = load_ssh_key(config["ssh"]["key_file"])
@@ -156,7 +168,7 @@ def run_save(config, services, filename, hours):
 
     def fetch_one(task):
         node_name, ip, label, src_type, identifier = task
-        cmd = docker_log_cmd(identifier, hours) if src_type == "docker" else systemd_log_cmd(identifier, hours)
+        cmd = docker_log_cmd(identifier, hours, level) if src_type == "docker" else systemd_log_cmd(identifier, hours, level)
         try:
             output = ssh_run(ip, ssh_user, ssh_key, cmd)
             return (node_name, label), output, None
@@ -181,7 +193,7 @@ def run_save(config, services, filename, hours):
     with open(filename, "w") as f:
         f.write("Authentik HA Cluster — Log Report\n")
         f.write(f"Fetched:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Scope:    last {hours}h, warnings and errors only\n")
+        f.write(f"Scope:    last {hours}h, {level} and above\n")
         f.write("=" * 80 + "\n")
 
         for node_name, info in node_map.items():
@@ -212,12 +224,13 @@ class LogsApp(App):
         ("q", "quit", "Quit"),
     ]
 
-    def __init__(self, config, services, hours):
+    def __init__(self, config, services, hours, level=DEFAULT_LOG_LEVEL):
         super().__init__()
         self.config = config
         self.ssh_user = config["ssh"]["username"]
         self.ssh_key = load_ssh_key(config["ssh"]["key_file"])
         self._hours = hours
+        self._level = level
         self._node_map = build_node_map(config, services)
 
     def compose(self) -> ComposeResult:
@@ -257,7 +270,7 @@ class LogsApp(App):
 
         def fetch_one(task):
             node_name, ip, label, src_type, identifier = task
-            cmd = docker_log_cmd(identifier, self._hours) if src_type == "docker" else systemd_log_cmd(identifier, self._hours)
+            cmd = docker_log_cmd(identifier, self._hours, self._level) if src_type == "docker" else systemd_log_cmd(identifier, self._hours, self._level)
             try:
                 output = ssh_run(ip, self.ssh_user, self.ssh_key, cmd)
                 return node_name, label, output, None
@@ -293,6 +306,12 @@ def main():
     parser.add_argument("--config", default="config.yml", help="Path to config file")
     parser.add_argument("--last", type=int, default=24, metavar="HOURS", help="Hours of logs to fetch (default: 24)")
     parser.add_argument("--save", metavar="FILE", help="Save logs to FILE as plain text (no TUI)")
+    parser.add_argument(
+        "--level",
+        choices=list(LOG_LEVELS),
+        default=DEFAULT_LOG_LEVEL,
+        help=f"Minimum severity to include (default: {DEFAULT_LOG_LEVEL})",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -305,9 +324,9 @@ def main():
 
     if args.save:
         save_path = args.save if args.save.endswith(".log") else args.save + ".log"
-        run_save(config, services, save_path, args.last)
+        run_save(config, services, save_path, args.last, args.level)
     else:
-        LogsApp(config, services, args.last).run()
+        LogsApp(config, services, args.last, args.level).run()
 
 
 if __name__ == "__main__":

@@ -107,6 +107,8 @@ python monitor.py --config custom_config.yaml
 
 Collects warnings and errors from the last 24 hours across every service and node via SSH. Bare-metal services are read from `journald`; containerised services are read from `docker logs`.
 
+The minimum severity to include is configurable via `--level` (`error`, `warning` — default, `info`, `debug`); each level includes everything at or above it in severity (e.g. `info` includes info/warning/error). `debug` disables filtering entirely and returns every line.
+
 ### TUI mode
 
 Node tabs across the top; service sub-tabs within each node. Results stream in per service as SSH calls complete.
@@ -114,6 +116,7 @@ Node tabs across the top; service sub-tabs within each node. Results stream in p
 ```bash
 python3 logs_viewer.py
 python3 logs_viewer.py --config custom_config.yml
+python3 logs_viewer.py --level error
 ```
 
 Key bindings:
@@ -130,6 +133,7 @@ Fetches all logs and writes a structured plain-text `.log` file — no TUI is sh
 ```bash
 python3 logs_viewer.py --save cluster_logs
 # writes: cluster_logs.log
+python3 logs_viewer.py --save cluster_logs --level info
 ```
 
 Output format:
@@ -137,7 +141,7 @@ Output format:
 ```
 Authentik HA Cluster — Log Report
 Fetched:  2026-04-28 15:30:00
-Scope:    last 24h, warnings and errors only
+Scope:    last 24h, warning and above
 ================================================================================
 
 NODE: ak-node-1  (10.99.97.71)
