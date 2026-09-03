@@ -55,6 +55,23 @@ nodes:
     - ip: "<node-3-ip>"
       name: "ak-node-3"
 
+# Scheme and TLS handling for the per-node / VIP nginx probes.
+# OPTIONAL — omit the whole block and behaviour is exactly as before
+# (https, port 443, no certificate verification). akropolis fills this in
+# automatically in the config it emits at handoff.
+#
+# A cluster provisioned without TLS (tls.provider: none) serves plain HTTP on
+# :80; probing it with https:// marks every node UNREACHABLE, which in turn
+# shows keepalived as FAULT, since nginx reachability is how this monitor
+# infers the track script's state.
+#
+# Authentik's own :9443 health/API endpoints are always HTTPS regardless
+# (AUTHENTIK_LISTEN__HTTPS is set either way) and are not affected.
+# scheme:
+#   nginx: "https"          # "http" for a tls.provider: none site
+#   nginx_port: 443         # 80 for a tls.provider: none site
+#   verify_tls: false       # true only for a publicly trusted cert
+
 ports:
   authentik: 9443
   patroni: 8008

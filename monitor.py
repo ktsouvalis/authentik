@@ -85,6 +85,32 @@ PG_USER             = CREDS.get("postgres_user", "postgres")
 PG_PASS             = CREDS.get("postgres_password", "")
 
 P_POSTGRES          = int(PORTS.get("postgres", 5432))
+
+# ---------------------------------------------------------------------------
+# Scheme / TLS
+#
+# The cluster's nginx does not always speak HTTPS: a site provisioned with
+# tls.provider "none" serves plain HTTP on :80, and probing it with https://
+# marks every node UNREACHABLE — which then also shows keepalived as FAULT,
+# because nginx reachability is what this monitor infers the track script from.
+#
+# akropolis emits these keys in the generated monitor config. They are OPTIONAL:
+# when absent the defaults reproduce the previous behaviour exactly
+# (https, :443, no certificate verification), so an existing production
+# config.yml keeps working untouched.
+#
+# Authentik's own health and API endpoints are deliberately NOT covered here:
+# AUTHENTIK_LISTEN__HTTPS is set regardless of the nginx TLS provider, so
+# :9443 is always HTTPS (self-signed on a lab site) and stays as it was.
+SCHEME_CFG   = CFG.get("scheme", {}) or {}
+NGINX_SCHEME = str(SCHEME_CFG.get("nginx", "https")).lower()
+NGINX_PORT   = int(SCHEME_CFG.get("nginx_port", 443 if NGINX_SCHEME == "https" else 80))
+VERIFY_TLS   = bool(SCHEME_CFG.get("verify_tls", False))
+
+
+def nginx_url(host: str, path: str = "/monitor") -> str:
+    """URL for the per-node (or VIP) nginx identity endpoint."""
+    return f"{NGINX_SCHEME}://{host}:{NGINX_PORT}{path}"
 SLOT_WARN_BYTES     = 100 * 1024 * 1024   # 100 MB — yellow
 SLOT_CRIT_BYTES     = 1024 ** 3           # 1 GB  — red
 
@@ -95,8 +121,8 @@ SLOT_CRIT_BYTES     = 1024 ** 3           # 1 GB  — red
 
 def check_keepalived_node(node: dict) -> dict:
     """
-    Hit https://<node_ip>/monitor — returns JSON with node name.
-    Also checks if this node currently holds the VIP by hitting https://<VIP>/monitor
+    Hit <scheme>://<node_ip>/monitor — returns JSON with node name.
+    Also checks if this node currently holds the VIP by hitting the VIP's /monitor
     and comparing the returned node name.
     Infers nginx up/down and calculates effective priority.
     """
@@ -107,8 +133,8 @@ def check_keepalived_node(node: dict) -> dict:
     # Check nginx on this node directly
     nginx_up = False
     try:
-        r = requests.get(f"https://{ip}/monitor",
-                         timeout=HTTP_TIMEOUT, verify=False)
+        r = requests.get(nginx_url(ip),
+                         timeout=HTTP_TIMEOUT, verify=VERIFY_TLS)
         nginx_up = r.status_code == 200
     except Exception:
         nginx_up = False
@@ -126,12 +152,12 @@ def check_keepalived_node(node: dict) -> dict:
 
 def check_vip_holder() -> dict:
     """
-    Hit https://<VIP>/monitor — the node that responds is the current MASTER.
+    Hit <scheme>://<VIP>/monitor — the node that responds is the current MASTER.
     Returns the node name/ip that holds the VIP, or None if VIP is unreachable.
     """
     try:
-        r = requests.get(f"https://{VIP}/monitor",
-                         timeout=HTTP_TIMEOUT, verify=False)
+        r = requests.get(nginx_url(VIP),
+                         timeout=HTTP_TIMEOUT, verify=VERIFY_TLS)
         if r.status_code == 200:
             data = r.json()
             return {
