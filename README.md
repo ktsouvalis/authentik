@@ -93,6 +93,30 @@ python monitor.py --config custom_config.yaml
 
 ---
 
+
+### Scheme / TLS (optional)
+
+The per-node and VIP `/monitor` probes default to `https://<host>:443`, which is
+correct for any TLS-terminating cluster. A cluster provisioned **without** TLS
+serves plain HTTP on `:80`; probing it with `https://` marks every node
+UNREACHABLE and, because nginx reachability is how keepalived state is inferred,
+shows every node as FAULT with a phantom priority drop.
+
+```yaml
+scheme:
+  nginx: "http"        # or "https" (default)
+  nginx_port: 80       # or 443 (default; inferred from nginx when omitted)
+  verify_tls: false    # true only for a publicly trusted certificate
+```
+
+Omit the block entirely and behaviour is exactly as before — existing configs
+need no changes. `akropolis` fills this in automatically in the config it emits
+at handoff.
+
+Authentik's own `:9443` health and API endpoints are unaffected: they are HTTPS
+regardless of the nginx TLS provider, since `AUTHENTIK_LISTEN__HTTPS` is always
+set.
+
 ## Key bindings (monitor.py)
 
 | Key | Action |
